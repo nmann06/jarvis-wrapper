@@ -10,6 +10,7 @@ import asyncio
 import difflib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -59,6 +60,8 @@ LOCAL_COMMANDS = {
     "copy": "Copy Jarvis's last reply to the clipboard",
     "export": "Save this conversation to a text file",
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
+    "computer": "Show which computer this window is running on",
+    "fuck": "Stop Jarvis right now, like esc",
     "exit": "Exit Jarvis",
 }
 ALIASES = {"quit": "exit", "q": "exit", "new": "clear", "reset": "clear", "continue": "resume",
@@ -1180,6 +1183,12 @@ class JarvisApp(App):
             return
         self.prompt.clear()
         self.menu.hide()
+        if text.strip().lower() == "/fuck":  # here, not in the queue, so nothing ahead of it holds it up
+            if self.busy:
+                self.run_worker(self.interrupt(), group="interrupt")
+            else:
+                self.footer.flash("Nothing to stop")
+            return
         self.history_index = -1
         if text in self.history:
             self.history.remove(text)
@@ -1368,6 +1377,8 @@ class JarvisApp(App):
             await self.cmd_export(args)
         elif name == "claude":
             await self.cmd_claude()
+        elif name == "computer":
+            await self.note(f"Running on {platform.node()} ({platform.system()} {platform.release()})")
         elif name in ONLY_IN_CLAUDE and name not in self.commands:
             await self.add(UserEntry(text))
             await self.add(NoticeEntry(notice(f"/{name} is one of regular Claude Code's own screens. Type /claude to "

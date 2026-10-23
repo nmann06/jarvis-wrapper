@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import platform
 import sys
 import time
 
@@ -250,6 +251,18 @@ async def test_escape_interrupts(home):
         assert any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
 
 
+async def test_fuck_stops_at_once(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "slow")
+        await until(pilot, lambda: replies(app))
+        await send(pilot, "/fuck")
+        await until(pilot, lambda: not app.busy)
+        assert any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+        assert [e.text for e in entries(app, UserEntry)] == ["slow"]
+
+
 async def test_up_arrow_walks_history(home):
     for text in ("first", "second"):
         sessions.add_history(text, str(home))
@@ -316,6 +329,15 @@ async def test_clear_starts_fresh(home):
         await send(pilot, "/clear")
         await until(pilot, lambda: not replies(app) and not app.busy)
         assert any("new conversation" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+
+
+async def test_computer_says_where_the_window_runs(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/computer")
+        await until(pilot, lambda: any("Running on" in text_of(n.renderable) for n in entries(app, NoticeEntry)))
+        assert any(platform.node() in text_of(n.renderable) for n in entries(app, NoticeEntry))
 
 
 async def test_resume_shows_saved_conversation(home):
