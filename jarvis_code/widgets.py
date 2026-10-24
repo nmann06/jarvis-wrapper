@@ -640,7 +640,7 @@ SHORTCUTS = [
     ("esc to interrupt", "ctrl+o to expand details"),
     ("esc esc to clear the prompt", "ctrl+t to show tasks"),
     ("ctrl+c twice to exit", "ctrl+g to edit in $EDITOR"),
-    ("ctrl+x s to send now", ""),
+    ("ctrl+x s to send now", "← for conversations"),
 ]
 
 
@@ -805,14 +805,24 @@ class Dialog(Vertical):
 
 class Picker(Dialog):
     """A dialog listing many things (sessions, models) with a filter line on top. Nine show at
-    a time; the arrows (and page up/down) scroll through the rest."""
+    a time; the arrows (and page up/down) scroll through the rest.
+
+    With new_text (the left-arrow list of conversations), the line on top is for something new
+    instead: typed there and sent with Enter, it resolves to ("new", text). ctrl+f turns it into
+    the filter and back; Esc while searching goes back to typing something new."""
 
     ROWS = 9
+    NEW_HINT = "Type to start a new one · ctrl+f to search · ↑↓ to scroll · Enter to pick · Esc to cancel"
+    SEARCH_HINT = "Type to search · ctrl+f or Esc to stop searching · ↑↓ to scroll · Enter to pick"
 
-    def __init__(self, title, items, hint="Type to filter · ↑↓ to scroll · Enter to pick · Esc to cancel"):
+    def __init__(self, title, items, hint="Type to filter · ↑↓ to scroll · Enter to pick · Esc to cancel",
+                 new_text=None):
         self.all_items = items  # (value, label, description)
-        self.filter = Input(placeholder="Type to search…", compact=True)
-        super().__init__(title, hint=hint)
+        self.new_text = new_text  # placeholder of the line when it's for something new
+        self.searching = new_text is None
+        self.filter = Input(placeholder="Type to search…" if self.searching else new_text, compact=True)
+        super().__init__(title, hint=hint if self.searching else self.NEW_HINT)
+        self.hint_view = Static(Text(self.hint), classes="hint")
         self.matches = list(items)
         self.cursor = 0  # in matches
         self.applied = ""
@@ -822,7 +832,7 @@ class Picker(Dialog):
         yield Static(Text(self.title_text), classes="title")
         yield self.filter
         yield self.choice_view
-        yield Static(Text(self.hint), classes="hint")
+        yield self.hint_view
 
     def take_focus(self):
         self.filter.focus()
@@ -845,7 +855,7 @@ class Picker(Dialog):
 
     def apply_filter(self):
         """Match the list to the filter as typed now (its change can arrive after Enter)."""
-        q = self.filter.value.lower().strip()
+        q = self.filter.value.lower().strip() if self.searching else ""
         if q == self.applied:
             return
         self.applied = q
@@ -859,9 +869,22 @@ class Picker(Dialog):
         self.apply_filter()
 
     def pick(self):
+        if not self.searching and self.filter.value.strip():
+            self.finish(("new", self.filter.value.strip()))
+            return
         self.apply_filter()
         if self.shown:
             self.finish(self.shown[self.index][0])
+
+    def set_searching(self, on, keep_text=True):
+        """Make the line on top the filter (on) or the start of something new."""
+        self.searching = on
+        if not keep_text:
+            self.filter.value = ""
+        self.filter.placeholder = "Search conversations…" if on else self.new_text
+        self.hint = self.SEARCH_HINT if on else self.NEW_HINT
+        self.hint_view.update(Text(self.hint))
+        self.apply_filter()
 
     def dialog_key(self, key):
         steps = {"up": -1, "down": 1, "pageup": -self.ROWS, "pagedown": self.ROWS}
@@ -872,6 +895,10 @@ class Picker(Dialog):
                 self.point_at(self.cursor + steps[key])
         elif key == "enter":
             self.pick()
+        elif key == "ctrl+f" and self.new_text is not None:
+            self.set_searching(not self.searching)
+        elif key == "escape" and self.new_text is not None and self.searching:
+            self.set_searching(False, keep_text=False)
         elif key == "escape":
             self.finish(None)
         else:

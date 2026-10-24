@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import uuid
 
 # Set by the Claude Code session a shell may be running inside. Inherited, they make the
@@ -23,6 +24,9 @@ SESSION_VARS = (
 )
 
 LINE_LIMIT = 256 * 1024 * 1024  # one JSON line can carry a whole file
+# Headless Claude Code runs away from this window's terminal: given it, Claude Code retitles the
+# tab "claude" (on Windows, by setting the title of the console it shares).
+DETACHED = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
 
 
 class EngineError(Exception):
@@ -110,7 +114,7 @@ class Engine:
         self.proc = await asyncio.create_subprocess_exec(
             *self.argv(), cwd=self.cwd, env=self.environment(), limit=LINE_LIMIT,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, start_new_session=True)
+            stderr=asyncio.subprocess.PIPE, **DETACHED)
         self._tasks = [asyncio.create_task(self._read()), asyncio.create_task(self._read_stderr())]
         self.info = await self.request("initialize", timeout=60)
         return self.info

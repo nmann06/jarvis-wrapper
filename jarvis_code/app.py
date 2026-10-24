@@ -22,6 +22,7 @@ from datetime import datetime
 
 from rich.console import Group
 from rich.text import Text
+from textual import events
 from textual.app import App
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -29,13 +30,14 @@ from textual.theme import Theme
 from textual.widgets import Markdown, Static
 
 from . import __version__, config_items, files, persona, sessions, stats, theme, tools
-from .engine import Engine, EngineError, claude_command, claude_path, clean_environment
+from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
                       Picker, PromptBar, QueuedPanel, Spinner, SuggestionMenu, TaskPanel,
                       ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, shortcuts)
 
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
+USAGE_REFRESH = 60   # seconds between asking for the plan's usage, so it keeps up with other windows
 
 # Headless Claude Code doesn't title conversations, so the window asks for one (for the tab
 # and /resume) in a separate, unsaved `claude -p` on Haiku, with no tools.
@@ -123,6 +125,43 @@ def git_branch(cwd):
     except (OSError, subprocess.SubprocessError):
         return ""
 
+
+
+def erase_is_delete():
+    """Whether the terminal's backspace sends DEL (^?), leaving ^H to ctrl+backspace: true of
+    GNOME Terminal, Konsole, Windows Terminal and most others (stty erase says which)."""
+    if os.name == "nt":
+        return True
+    import termios
+    try:
+        return termios.tcgetattr(sys.stdin.fileno())[6][termios.VERASE] in (b"\x7f", 127)
+    except (AttributeError, OSError, ValueError, termios.error):
+        return True
+
+
+ERASE_IS_DELETE = erase_is_delete()
+
+
+def is_word_backspace(event):
+    """ctrl+backspace (or alt+backspace). Textual reads the ^H most terminals send for it as a
+    plain backspace, and its Input deletes the word to the right on ctrl+backspace."""
+    if event.key in ("ctrl+backspace", "alt+backspace"):
+        return True
+    return event.key == "backspace" and event.character == "\x08" and ERASE_IS_DELETE
+
+
+def console_title(title=None):
+    """On Windows, the console's title: set to title, or read (None to leave it). PowerShell's
+    window and Windows Terminal's tab show it, escape codes on or not. Elsewhere, None."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    if title is not None:
+        kernel32.SetConsoleTitleW(title)
+        return title
+    buf = ctypes.create_unicode_buffer(1024)
+    return buf.value if kernel32.GetConsoleTitleW(buf, len(buf)) else None
 
 def user_text(content):
     if isinstance(content, str):
@@ -250,6 +289,11 @@ class JarvisApp(App):
         Binding("pagedown", "page(1)", show=False, priority=True),
     ]
 
+    async def on_event(self, event):
+        if isinstance(event, events.Key) and is_word_backspace(event):
+            event = events.Key("ctrl+w", None)  # delete a word, in the prompt and in every Input
+        await super().on_event(event)
+
     def __init__(self, options: Options):
         super().__init__(ansi_color=True)
         self.options = options
@@ -341,6 +385,7 @@ class JarvisApp(App):
         self.permission_queue = asyncio.Queue()
         self.submissions = asyncio.Queue()
         self.set_interval(0.08, self.tick)
+        self.set_interval(USAGE_REFRESH, self.refresh_usage)
         self.run_worker(self.permission_loop(), group="permissions")
         self.run_worker(self.submission_loop(), group="submissions")
         self.run_worker(self.file_index.load(), group="files")
@@ -403,12 +448,21 @@ class JarvisApp(App):
         account = self.info.get("account") or {}
         self.banner.set_info(plan=account.get("subscriptionType"), version=self.info.get("claude_code_version"))
         await self.refresh_settings()
-        self.run_worker(self.fetch_usage(engine), group="usage")
+        self.run_worker(self.fetch_usage(engine), group="usage", exclusive=True)
         return True
+
+    def refresh_usage(self):
+        """Ask again how much of the plan is used. It's shared with every other Claude (other
+        windows, Claude Code, claude.ai), so a turn here isn't the only thing that moves it."""
+        if self.engine is not None and self.engine.running:
+            self.run_worker(self.fetch_usage(self.engine), group="usage", exclusive=True)
+
+    def on_app_focus(self):
+        self.refresh_usage()  # back from another window, maybe one that used some
 
     async def fetch_usage(self, engine):
         """How much of the plan is used (5-hour and weekly) and when the 5-hour window resets,
-        for the footer: when Claude Code starts and after each turn."""
+        for the footer: when Claude Code starts, after each turn, every minute and on coming back to the window."""
         try:
             limits = (await engine.request("get_usage", timeout=90)).get("rate_limits") or {}
         except EngineError:
@@ -430,8 +484,15 @@ class JarvisApp(App):
     def set_session_end(self, when):
         if when and when != self.session_ends:
             self.session_ends = when
-            self.set_timer(max(0.0, when - time.time()) + 1, self.update_footer)  # drop it once passed
+            self.set_timer(max(0.0, when - time.time()) + 1, self.session_over)
             self.update_footer()
+
+    def session_over(self):
+        """The 5-hour window's end came: what it used no longer counts. Ask for the new one."""
+        if self.session_ends and self.session_ends <= time.time():
+            self.usage.pop("five_hour", None)
+            self.update_footer()
+            self.refresh_usage()
 
     async def stop_engine(self):
         engine, self.engine = self.engine, None
@@ -807,8 +868,7 @@ class JarvisApp(App):
             self.queued_panel.show([])
             self.end_turn()
         self.run_worker(self.refresh_context(), group="context")
-        if self.engine:
-            self.run_worker(self.fetch_usage(self.engine), group="usage", exclusive=True)
+        self.refresh_usage()
         self.name_conversation()
         if self.commands_pending:
             self.commands_pending = False
@@ -829,7 +889,15 @@ class JarvisApp(App):
                 self.usage[name] = round(utilization * 100)  # a fraction here, a percent in get_usage
         when = strftime(datetime.fromtimestamp(resets), "%-I:%M %p").lower() if resets else ""
         self.limit_note = f"usage limit reached · resets {when}".strip() if info.get("status") == "rejected" else ""
+        if self.limit_note and resets:
+            self.set_timer(max(0.0, resets - time.time()) + 1, lambda: self.limit_over(resets))
         self.update_footer()
+
+    def limit_over(self, resets):
+        if self.limit_note and resets <= time.time():
+            self.limit_note = ""
+            self.update_footer()
+            self.refresh_usage()
 
     async def on_reset(self, msg):
         """/clear: a new conversation, same window."""
@@ -1419,13 +1487,14 @@ class JarvisApp(App):
                 Text("  ".join(f"/{n}" for n in sorted(engine)), style=theme.DIM)]
         await self.add(NoticeEntry(tools.block(rows)))
 
-    async def pick_session(self, everywhere=False):
-        """A conversation to resume: from this folder, or (everywhere) from any folder."""
+    async def pick_session(self, everywhere=False, new=False):
+        """A conversation to resume: from this folder, or (everywhere) from any folder. With
+        new, typing starts a new one instead, returned as ("new", prompt); ctrl+f searches."""
         if everywhere:
             found = await asyncio.to_thread(sessions.list_all_sessions)
         else:
             found = sessions.list_sessions(self.cwd)
-        if not found:
+        if not found and not new:
             await self.note("No earlier conversations." if everywhere else "No earlier conversations in this folder.")
             return None
 
@@ -1439,6 +1508,9 @@ class JarvisApp(App):
 
         items = [(s.id, tools.one_line(s.title, 70), about(s)) for s in found]
         title = f"Resume a conversation ({len(found)}, every folder)" if everywhere else "Resume a conversation"
+        if new:
+            title = title.replace("Resume a conversation", "Conversations", 1)
+            return await self.show_dialog(Picker(title, items, new_text="Type to start a new conversation…"))
         return await self.show_dialog(Picker(title, items))
 
     def show_all_sessions(self):
@@ -1449,9 +1521,24 @@ class JarvisApp(App):
         return True
 
     async def cmd_all_sessions(self):
-        session_id = await self.pick_session(everywhere=True)
-        if session_id:
-            await self.switch_session(session_id)
+        picked = await self.pick_session(everywhere=True, new=True)
+        if isinstance(picked, tuple):
+            await self.new_session(picked[1])
+        elif picked:
+            await self.switch_session(picked)
+
+    async def new_session(self, text):
+        """A new conversation, in this folder, started with text."""
+        await self.stop_engine()
+        await self.clear_transcript()
+        self.set_tab_title(None)
+        self.history_index = -1
+        if text in self.history:
+            self.history.remove(text)
+        self.history.insert(0, text)
+        sessions.add_history(text, self.cwd, None)
+        if await self.start_engine():
+            await self.submit(text)
 
     async def cmd_resume(self, args):
         session_id = args or await self.pick_session()
@@ -1522,8 +1609,10 @@ class JarvisApp(App):
             self.titled = None
         clean = re.sub(r"[\x00-\x1f\x7f]", "", title or "Jarvis")
         driver = getattr(self, "_driver", None)
-        if driver is not None and sys.stdout.isatty():
-            driver.write(f"\033]0;{clean}\007")
+        if sys.stdout.isatty():
+            if driver is not None:
+                driver.write(f"\033]0;{clean}\007")
+            console_title(clean)
 
     async def show_history(self, path):
         messages = sessions.load_conversation(path)
@@ -1578,7 +1667,7 @@ class JarvisApp(App):
         argv = claude_command(self.options.engine_command) + ["-p", prompt, "--no-session-persistence", *extra]
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=self.cwd, env=clean_environment(), stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **DETACHED)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
@@ -1746,6 +1835,7 @@ class JarvisApp(App):
             print("\nOpening this conversation in regular Claude Code. Exit it (/exit) to come back to Jarvis.\n",
                   flush=True)
             subprocess.run(argv, cwd=self.cwd, env=env)
+        self.set_tab_title(self.tab_title)  # Claude Code titled the tab its own way
         if not session_id:
             recent = [s for s in sessions.list_sessions(self.cwd, limit=1) if s.modified >= started]
             session_id = recent[0].id if recent else None

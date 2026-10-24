@@ -521,3 +521,80 @@ async def test_background_tasks_in_footer(home):
         await until(pilot, lambda: not app.busy and "1 background task" in app.footer.right)
         await send(pilot, "stop background server")
         await until(pilot, lambda: not app.busy and "background" not in app.footer.right)
+
+
+async def test_left_arrow_typing_starts_a_new_conversation(home):
+    save_session(home, home, "old1", "plan the buck converter")
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "first chat")
+        await until(pilot, lambda: not app.busy and len(entries(app, UserEntry)) == 1)
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        await pilot.press(*"buck", "enter")  # typing isn't searching: it's a new conversation
+        await until(pilot, lambda: app.dialog is None and app.engine_state == "running"
+                    and [e.text for e in entries(app, UserEntry)] == ["buck"])
+        assert app.history[0] == "buck"
+
+
+async def test_left_arrow_ctrl_f_searches(home, monkeypatch):
+    monkeypatch.chdir(home)
+    save_session(home, home, "old1", "plan the buck converter")
+    save_session(home, home, "old2", "notes on op amps")
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        picker = app.dialog
+        await pilot.press("ctrl+f", *"op amp")
+        await until(pilot, lambda: [v for v, _, _ in picker.matches] == ["old2"])
+        await pilot.press("escape")  # stops searching, without closing
+        await until(pilot, lambda: len(picker.matches) == 2 and picker.filter.value == "")
+        assert app.dialog is picker
+        await pilot.press("ctrl+f", *"buck", "enter")
+        await until(pilot, lambda: app.dialog is None and app.engine_state == "running"
+                    and [e.text for e in entries(app, UserEntry)] == ["plan the buck converter"])
+        assert app.session_id == "old1"
+
+
+async def test_ctrl_backspace_deletes_a_word(home, monkeypatch):
+    from textual import events
+    from jarvis_code import app as app_module
+    monkeypatch.setattr(app_module, "ERASE_IS_DELETE", True)
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        app.prompt.set_text("charge the capacitor")
+        app.post_message(events.Key("backspace", "\x08"))  # what most terminals send for ctrl+backspace
+        await until(pilot, lambda: app.prompt.text == "charge the ")
+        app.post_message(events.Key("backspace", "\x7f"))  # backspace itself: one letter
+        await until(pilot, lambda: app.prompt.text == "charge the")
+        app.post_message(events.Key("ctrl+backspace", None))  # a terminal that sends it as such
+        await until(pilot, lambda: app.prompt.text == "charge ")
+        app.prompt.clear()
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        await pilot.press(*"buck converter")
+        app.post_message(events.Key("ctrl+backspace", None))  # Input's own would delete to the right
+        await until(pilot, lambda: app.dialog.filter.value == "buck ")
+
+
+async def test_usage_keeps_up_with_other_windows_and_the_5_hour_reset(home, monkeypatch):
+    from jarvis_code import app as app_module
+    monkeypatch.setattr(app_module, "USAGE_REFRESH", 0.3)
+    asked = lambda: sum(1 for m in sent(home) if m.get("request", {}).get("subtype") == "get_usage")
+    app = make(home)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await ready(pilot)
+        await until(pilot, lambda: app.usage.get("five_hour") == 62)
+        app.usage["five_hour"] = 5  # stale, as if another window had used some since
+        await until(pilot, lambda: asked() >= 3 and app.usage.get("five_hour") == 62)  # asked again unprompted
+        app.session_ends = time.time() - 1  # the window's end came
+        app.session_over()
+        assert "five_hour" not in app.usage and "5-hour" not in app.footer.right
+        await until(pilot, lambda: app.usage.get("five_hour") == 62 and app.session_ends > time.time())
+        resets = int(time.time()) - 1
+        app.on_rate_limit({"rate_limit_info": {"status": "rejected", "resetsAt": resets}})
+        await until(pilot, lambda: "limit reached" not in app.footer.right)  # dropped once its reset passed

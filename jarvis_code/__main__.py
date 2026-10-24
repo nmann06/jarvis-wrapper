@@ -37,20 +37,25 @@ def parse(argv):
 
 def main(argv=None):
     args = parse(sys.argv[1:] if argv is None else argv)
-    from .app import JarvisApp, Options  # after parsing, so --help is instant
+    from .app import JarvisApp, Options, console_title  # after parsing, so --help is instant
 
     options = Options(cwd=os.getcwd(), model=args.model, effort=args.effort,
                       permission_mode=args.mode, resume=args.resume, continue_last=args.continue_last,
                       prompt=args.prompt, persona=not args.plain, thinking_display=args.thinking,
                       log_path=args.log)
     tty = sys.stdout.isatty()
-    if tty:
+    old_title = console_title() if tty else None
+    if old_title is not None:
+        console_title("Jarvis")  # Windows: escape codes may not be on yet, and it restores the same way
+    elif tty:
         sys.stdout.write("\033[22;0t\033]0;Jarvis\007")  # keep the old title, show Jarvis
         sys.stdout.flush()
     try:
         session = JarvisApp(options).run()
     finally:
-        if tty:
+        if old_title is not None:
+            console_title(old_title)
+        elif tty:
             sys.stdout.write("\033[23;0t")
             sys.stdout.flush()
     if session and tty:
