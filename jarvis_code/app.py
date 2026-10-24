@@ -859,8 +859,10 @@ class JarvisApp(App):
         elif took >= 8 and msg.get("num_turns"):
             await self.add(DoneEntry(took))
         # Prompts shown already were taken in; ones still queued come next, as a new turn.
+        # Claude Code keeps them through an interrupt too (that's how ctrl+x s sends them now).
         self.sent = [item for item in self.sent if not item[1]]
-        if self.sent and not self.interrupting:
+        if self.sent:
+            self.interrupting = False
             self.turn_started = time.monotonic()
         else:
             self.sent.clear()
@@ -949,12 +951,13 @@ class JarvisApp(App):
 
     async def stop_turn(self, timeout=15):
         """Interrupt the turn in progress and wait for it to end, so the next prompt (ctrl+x s)
-        starts a turn of its own instead of waiting in the queue."""
+        starts a turn of its own instead of waiting for this one (prompts already queued still
+        go first)."""
         if not self.busy:
             return
         await self.interrupt()
         deadline = time.monotonic() + timeout
-        while self.busy and time.monotonic() < deadline:
+        while self.busy and self.interrupting and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
 
     def tick(self):
@@ -1248,6 +1251,8 @@ class JarvisApp(App):
     async def on_prompt_input_submitted(self, event):
         text = event.text
         if not text.strip():
+            if event.now:
+                self.send_queued_now()
             return
         self.prompt.clear()
         self.menu.hide()
@@ -1263,6 +1268,14 @@ class JarvisApp(App):
         self.history.insert(0, text)
         sessions.add_history(text, self.cwd, self.session_id)
         self.submissions.put_nowait((text, event.now))
+
+    def send_queued_now(self):
+        """ctrl+x s on an empty prompt: stop the turn in progress, and the prompts queued behind
+        it, which Claude Code keeps, run straight away."""
+        if not self.queued:
+            self.footer.flash("Nothing queued")
+            return
+        self.run_worker(self.interrupt(), group="interrupt")
 
     async def submission_loop(self):
         """Prompts run here, one at a time and in order, never in a key handler: a command

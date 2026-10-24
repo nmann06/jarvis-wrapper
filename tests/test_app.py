@@ -598,3 +598,28 @@ async def test_usage_keeps_up_with_other_windows_and_the_5_hour_reset(home, monk
         resets = int(time.time()) - 1
         app.on_rate_limit({"rate_limit_info": {"status": "rejected", "resetsAt": resets}})
         await until(pilot, lambda: "limit reached" not in app.footer.right)  # dropped once its reset passed
+
+
+async def test_ctrl_x_ctrl_s_sends_the_queued_prompt_now(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "slow")
+        await until(pilot, lambda: app.busy and replies(app))
+        await send(pilot, "hello")
+        assert app.queued == ["hello"] and app.prompt.text == ""
+        started = time.monotonic()
+        await pilot.press("ctrl+x", "ctrl+s")
+        await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy)
+        assert time.monotonic() - started < 3  # not after the slow one finished
+        assert any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+        assert [e.text for e in entries(app, UserEntry)] == ["slow", "hello"]
+        assert not app.queued and not app.queued_panel.display
+
+
+async def test_ctrl_x_s_with_nothing_queued_says_so(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await pilot.press("ctrl+x", "ctrl+s")
+        assert app.footer.flash_text == "Nothing queued" and not app.busy

@@ -420,7 +420,8 @@ class HRule(Static):
 
 
 class PromptInput(TextArea):
-    """The prompt. Enter sends (queued while Jarvis is busy), ctrl+x s sends now (interrupting);
+    """The prompt. Enter sends (queued while Jarvis is busy), ctrl+x s sends now (interrupting;
+    on an empty prompt, sending what's queued);
     \\+Enter, ctrl+j or alt+enter start a new line; the arrows walk
     the suggestion menu when it's open and the prompt history at the first or last line."""
 
