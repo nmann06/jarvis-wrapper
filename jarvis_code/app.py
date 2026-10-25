@@ -41,6 +41,12 @@ from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, 
 CHORD_TIME = 2       # seconds after ctrl+x in which s sends now
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
 USAGE_REFRESH = 60   # seconds between asking for the plan's usage, so it keeps up with other windows
+SETTINGS = os.path.expanduser("~/.claude/jarvis-window.json")  # the window's own settings (/keepitgoin)
+
+# /keepitgoin: a turn cut off by the usage limit carries on by itself once the limit resets,
+# at most this many times in a row (a limit that's still there when it says it reset).
+KEEP_GOING_PROMPT = "The usage limit has reset. Carry on with what you were doing."
+KEEP_GOING_TRIES = 3
 
 # Headless Claude Code doesn't title conversations, so the window asks for one (for the tab
 # and /resume) in a separate, unsaved `claude -p` on Haiku, with no tools.
@@ -74,6 +80,7 @@ LOCAL_COMMANDS = {
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
     "btw": "Ask a quick side question without interrupting or adding to the conversation",
     "manager": "Project manager mode: Jarvis hands the work to worker Jarvises (/manager off to stop)",
+    "keepitgoin": "Carry on by itself when a usage limit resets (/keepitgoin on|off; no args toggles)",
     "computer": "Show which computer this window is running on",
     "fuck": "Stop Jarvis right now, like esc",
     "exit": "Exit Jarvis",
@@ -123,6 +130,30 @@ def pretty_model(model):
     numbers = [p for p in parts[1:] if p.isdigit() and len(p) < 3]
     label = f"{family} {'.'.join(numbers)}" if numbers else family
     return label + (" (1M)" if long_context else "")
+
+
+def load_setting(key, default):
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f).get(key, default)
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+def save_setting(key, value):
+    try:
+        with open(SETTINGS) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    saved[key] = value
+    try:
+        with open(SETTINGS, "w") as f:
+            json.dump(saved, f, indent=2)
+    except OSError:
+        pass
 
 
 def git_branch(cwd):
@@ -406,6 +437,9 @@ class JarvisApp(App):
         self.last_escape = 0.0
         self.context_pct = None
         self.limit_note = ""
+        self.keep_going = load_setting("keep_going", True)  # /keepitgoin
+        self.stalled = None               # a turn hit the usage limit: when it resets (epoch seconds)
+        self.kept_going = 0               # times in a row /keepitgoin has carried on
         self.session_ends = None          # when the 5-hour usage window resets (epoch seconds)
         self.usage = {}                   # % of the plan used: {"five_hour": 13, "seven_day": 28}
         self.tab_title = None             # the terminal tab's title: what the conversation is about
@@ -639,7 +673,10 @@ class JarvisApp(App):
             if self.session_ends and self.session_ends > time.time() and "resets" not in self.limit_note:
                 clock = strftime(datetime.fromtimestamp(self.session_ends), "%-I:%M%p")
                 session = (session or "5-hour session") + " ends " + clock.lower().replace(":00", "")
-            parts = (self.limit_note, session,
+            limit = self.limit_note
+            if limit and self.stalled and self.keep_going:
+                limit += " · keeps going then"
+            parts = (limit, session,
                      f"weekly {self.usage['seven_day']}%" if "seven_day" in self.usage else "",
                      f"{running} background task{'s' if running != 1 else ''}" if running else "",
                      self.model_label(), self.effort and f"{self.effort} effort",
@@ -958,6 +995,8 @@ class JarvisApp(App):
             await self.add(NoticeEntry(notice(str(text), theme.ERROR)))
         elif took >= 8 and msg.get("num_turns"):
             await self.add(DoneEntry(took))
+        if not self.limit_note:  # it got through: nothing left to carry on
+            self.stalled, self.kept_going = None, 0
         # Prompts shown already were taken in; ones still queued come next, as a new turn.
         # Claude Code keeps them through an interrupt too (that's how ctrl+x s sends them now).
         self.sent = [item for item in self.sent if not item[1]]
@@ -989,15 +1028,46 @@ class JarvisApp(App):
                 self.usage[name] = round(utilization * 100)  # a fraction here, a percent in get_usage
         when = strftime(datetime.fromtimestamp(resets), "%-I:%M %p").lower() if resets else ""
         self.limit_note = f"usage limit reached · resets {when}".strip() if info.get("status") == "rejected" else ""
+        if self.limit_note and self.busy:
+            self.stalled = resets or None  # cut off mid-turn: /keepitgoin carries on at the reset
         if self.limit_note and resets:
             self.set_timer(max(0.0, resets - time.time()) + 1, lambda: self.limit_over(resets))
         self.update_footer()
 
     def limit_over(self, resets):
-        if self.limit_note and resets <= time.time():
+        if resets > time.time():
+            return
+        if self.limit_note:
             self.limit_note = ""
             self.update_footer()
             self.refresh_usage()
+        self.keep_it_going()
+
+    def keep_it_going(self):
+        """/keepitgoin: the limit that cut a turn off has reset, so Jarvis carries on by itself."""
+        if not (self.keep_going and self.stalled and self.stalled <= time.time()) or self.busy:
+            return
+        self.stalled = None
+        if self.kept_going >= KEEP_GOING_TRIES:
+            self.footer.flash(f"Usage limit still there after {KEEP_GOING_TRIES} tries; not carrying on", 5)
+            return
+        self.kept_going += 1
+        self.submissions.put_nowait((KEEP_GOING_PROMPT, False))
+
+    async def cmd_keep_going(self, args):
+        arg = args.lower()
+        if arg not in ("", "on", "off"):
+            self.footer.flash("Usage: /keepitgoin [on|off]", 3)
+            return
+        self.keep_going = (arg == "on") if arg else not self.keep_going
+        save_setting("keep_going", self.keep_going)
+        self.update_footer()
+        if self.keep_going:
+            await self.note("Keep it goin' is on: when a usage limit cuts Jarvis off mid-task, it carries "
+                            "on by itself once the limit resets. /keepitgoin again turns it off.")
+            self.keep_it_going()  # it may have reset already
+        else:
+            await self.note("Keep it goin' is off: after a usage limit, Jarvis waits for you.")
 
     async def on_reset(self, msg):
         """/clear: a new conversation, same window."""
@@ -1626,6 +1696,8 @@ class JarvisApp(App):
             self.cmd_btw(args)
         elif name == "manager":
             await self.cmd_manager(args)
+        elif name == "keepitgoin":
+            await self.cmd_keep_going(args)
         elif name == "computer":
             await self.note(f"Running on {platform.node()} ({platform.system()} {platform.release()})")
         elif name in ONLY_IN_CLAUDE and name not in self.commands:

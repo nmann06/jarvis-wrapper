@@ -242,6 +242,14 @@ def turn(prompt, message_uuid=None):
         out = "\n".join(f"file{i}.txt" for i in range(12))
         tool_result("toolu_bash", out, {"stdout": out, "stderr": ""})
         stream_text(mid, 1, "Twelve files.")
+    elif "hit the limit" in p:  # the plan's usage limit, resetting in a moment
+        emit({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "resetsAt": int(time.time()) + 1, "rateLimitType": "five_hour"}})
+        emit({"type": "assistant", "parent_tool_use_id": None,
+              "message": {"id": mid, "model": "<synthetic>", "role": "assistant",
+                          "content": [{"type": "text", "text": "You've hit your limit"}]}})
+        result("You've hit your limit", is_error=True)
+        return
     elif "slow" in p:
         delay = 0.3 if "very slow" in p else 0.03  # very slow: about 18 seconds, for an interrupt to end
         if not stream_text(mid, 0, " ".join(["word"] * 60), delay=delay):

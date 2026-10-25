@@ -13,7 +13,7 @@ from rich.console import Console
 
 from textual.widget import Widget
 
-from jarvis_code import sessions, theme
+from jarvis_code import app as app_module, sessions, theme
 from jarvis_code.app import JarvisApp, Options
 from jarvis_code.widgets import AssistantEntry, NoticeEntry, ThinkingEntry, ToolEntry, UnqueueButton, UserEntry
 
@@ -26,6 +26,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions, "HISTORY", str(tmp_path / "history.jsonl"))
     monkeypatch.setattr(sessions, "PROJECTS", str(tmp_path / "projects"))
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "sent.jsonl"))
+    monkeypatch.setattr(app_module, "SETTINGS", str(tmp_path / "jarvis-window.json"))
     (tmp_path / "notes.txt").write_text("alpha\n")
     return tmp_path
 
@@ -676,6 +677,29 @@ async def test_usage_keeps_up_with_other_windows_and_the_5_hour_reset(home, monk
         resets = int(time.time()) - 1
         app.on_rate_limit({"rate_limit_info": {"status": "rejected", "resetsAt": resets}})
         await until(pilot, lambda: "limit reached" not in app.footer.right)  # dropped once its reset passed
+
+
+async def test_keepitgoin_carries_on_when_the_usage_limit_resets(home):
+    prompts = lambda: [m["message"]["content"] for m in sent(home) if m.get("type") == "user"]
+    app = make(home)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await ready(pilot)
+        assert app.keep_going  # on unless turned off
+        await send(pilot, "hit the limit")
+        await until(pilot, lambda: not app.busy and "keeps going then" in app.footer.right)
+        await until(pilot, lambda: app_module.KEEP_GOING_PROMPT in prompts())  # carried on at the reset
+        await until(pilot, lambda: not app.busy and app.stalled is None and app.kept_going == 0)
+
+        await send(pilot, "/keepitgoin")
+        await until(pilot, lambda: not app.keep_going)
+        assert json.loads((home / "jarvis-window.json").read_text()) == {"keep_going": False}
+        await send(pilot, "hit the limit")
+        await until(pilot, lambda: app.stalled is not None and not app.busy)
+        await pilot.pause(2.5)  # the limit resets, and Jarvis waits
+        assert prompts().count(app_module.KEEP_GOING_PROMPT) == 1
+        await send(pilot, "/keepitgoin on")  # turned back on after the reset: carries on now
+        await until(pilot, lambda: prompts().count(app_module.KEEP_GOING_PROMPT) == 2)
+    assert make(home).keep_going  # saved: a new window reads it
 
 
 async def test_ctrl_x_ctrl_s_sends_the_queued_prompt_now(home):
