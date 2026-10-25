@@ -15,7 +15,8 @@ from textual.widget import Widget
 
 from jarvis_code import app as app_module, sessions, theme
 from jarvis_code.app import JarvisApp, Options
-from jarvis_code.widgets import AssistantEntry, NoticeEntry, ThinkingEntry, ToolEntry, UnqueueButton, UserEntry
+from jarvis_code.widgets import (AssistantEntry, NoticeEntry, Picker, SessionsPage, Splash, ThinkingEntry,
+                                 ToolEntry, UnqueueButton, UserEntry)
 
 FAKE = [sys.executable, os.path.join(os.path.dirname(__file__), "fake_claude.py")]
 SIZE = (110, 40)
@@ -516,7 +517,7 @@ async def test_left_arrow_lists_every_session_and_resumes_in_its_folder(home, mo
     monkeypatch.chdir(home)  # resuming moves the window (and the process) to the other folder
     other = home / "other"
     other.mkdir()
-    for n in range(11):
+    for n in range(40):
         save_session(home, home, f"here{n}", f"chat {n} here")
     away = save_session(home, other, "away1", "plan the buck converter")
     os.utime(away, (1, 1))  # the oldest: the list has to scroll to reach it
@@ -526,16 +527,48 @@ async def test_left_arrow_lists_every_session_and_resumes_in_its_folder(home, mo
         await pilot.press("left")
         await until(pilot, lambda: app.dialog is not None)
         picker = app.dialog
-        assert "12, every folder" in picker.title_text and len(picker.shown) == 9
-        assert "↓ 3 more" in text_of(picker.choice_view.content)
-        await pilot.press("pagedown", "pagedown")  # nine at a time, stopping at the end
-        assert picker.shown[picker.index][0] == "away1" and "↑ 3 more" in text_of(picker.choice_view.content)
+        await until(pilot, lambda: picker.rows > Picker.ROWS)  # as many as fit on the page
+        rows = picker.rows
+        assert "41, every folder" in picker.title_text and len(picker.shown) == rows
+        assert f"↓ {41 - rows} more" in text_of(picker.choice_view.content)
+        await pilot.press("pagedown", "pagedown", "pagedown")  # a page at a time, stopping at the end
+        assert (picker.shown[picker.index][0] == "away1"
+                and f"↑ {41 - rows} more" in text_of(picker.choice_view.content))
         assert "other" in text_of(picker.choice_view.content)
         await pilot.press("enter")
         await until(pilot, lambda: app.dialog is None and app.engine_state == "running"
                     and [e.text for e in entries(app, UserEntry)] == ["plan the buck converter"])
         assert app.session_id == "away1" and app.cwd == str(other)
         assert os.path.realpath(os.getcwd()) == os.path.realpath(other)
+
+
+async def test_the_conversations_are_a_page_of_their_own(home):
+    save_session(home, home, "old1", "plan the buck converter")
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "hello")
+        await until(pilot, lambda: replies(app))
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        page = app.screen
+        assert isinstance(page, SessionsPage) and page.picker is app.dialog
+        assert "╚█████╔╝" in text_of(page.query_one(Splash).render())
+        await until(pilot, lambda: page.picker.rows > Picker.ROWS)  # the list fills the page
+        await pilot.press("escape")
+        await until(pilot, lambda: app.dialog is None)
+        assert not isinstance(app.screen, SessionsPage) and app.transcript.region.height > 20
+
+
+async def test_the_banner_goes_back_to_the_top_after_a_dialog_squeezed_it(home):
+    app = make(home)
+    async with app.run_test(size=(110, 22)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/model")
+        await until(pilot, lambda: app.dialog is not None and app.transcript.is_anchored)
+        await pilot.press("escape")
+        await until(pilot, lambda: app.dialog is None and not app.transcript.is_anchored
+                    and app.transcript.scroll_y == 0)
 
 
 async def test_a_manager_conversation_reopens_with_its_threads(home):

@@ -13,6 +13,7 @@ from rich.text import Text
 from textual import events
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.screen import Screen
 from textual.widget import Widget
 from textual.widgets import Input, Markdown, Static, TextArea
 
@@ -67,6 +68,22 @@ class Banner(Static):
         lines.append(Text(""))
         lines.append(Text("/help for commands · shift+tab to switch modes · @ to add files · ! for shell",
                           style=theme.DIM))
+        return Group(*lines)
+
+
+class Splash(Static):
+    """The big JARVIS letters, on top of the page of conversations."""
+
+    DEFAULT_CSS = "Splash { height: auto; padding: 1 0; }"
+
+    def render(self):
+        if (self.size.width or 80) < len(theme.JARVIS_ROWS[0]) + 2:
+            return Text("◆ J.A.R.V.I.S.", style=f"bold {theme.ACCENT}", justify="center")
+        lines = [Text(row, style=f"bold {colour}", justify="center")
+                 for row, colour in zip(theme.JARVIS_ROWS, theme.GRADIENT)]
+        lines.append(Text(""))
+        lines.append(Text("Just A Rather Vaguely Intelligent System", style=theme.LABEL,
+                          justify="center"))
         return Group(*lines)
 
 
@@ -1138,6 +1155,7 @@ class Picker(Dialog):
         super().__init__(title, hint=hint if self.searching else self.NEW_HINT)
         self.hint_view = Static(Text(self.hint), classes="hint")
         self.matches = list(items)
+        self.rows = self.ROWS  # shown at a time; on a page, as many as fit
         self.cursor = 0  # in matches
         self.applied = ""
         self.point_at(0)
@@ -1156,10 +1174,10 @@ class Picker(Dialog):
         self.cursor = cursor % len(self.matches) if self.matches else 0
         if self.cursor < self.first:
             self.first = self.cursor
-        elif self.cursor >= self.first + self.ROWS:
-            self.first = self.cursor - self.ROWS + 1
-        self.first = max(0, min(self.first, len(self.matches) - self.ROWS))
-        self.shown = self.matches[self.first:self.first + self.ROWS]
+        elif self.cursor >= self.first + self.rows:
+            self.first = self.cursor - self.rows + 1
+        self.first = max(0, min(self.first, len(self.matches) - self.rows))
+        self.shown = self.matches[self.first:self.first + self.rows]
         self.choices = [(label, d) for _, label, d in self.shown] or [("(nothing matches)", "")]
         self.index = self.cursor - self.first
 
@@ -1204,7 +1222,7 @@ class Picker(Dialog):
         self.apply_filter()
 
     def dialog_key(self, key):
-        steps = {"up": -1, "down": 1, "pageup": -self.ROWS, "pagedown": self.ROWS}
+        steps = {"up": -1, "down": 1, "pageup": -self.rows, "pagedown": self.rows}
         if key in steps:
             if key.startswith("page"):  # stop at the ends rather than wrapping
                 self.point_at(max(0, min(len(self.matches) - 1, self.cursor + steps[key])))
@@ -1229,6 +1247,37 @@ class Picker(Dialog):
         self.pick()
 
 
+class SessionsPage(Screen):
+    """The conversations, on a page of their own: JARVIS on top, the list (a Picker) below,
+    as many rows as fit."""
+
+    DEFAULT_CSS = f"""
+    SessionsPage {{ background: ansi_default; layout: vertical; }}
+    SessionsPage > Picker {{ height: 1fr; max-height: 100%; border: none; margin: 0 2; }}
+    SessionsPage > Picker:focus-within {{ border: none; }}
+    SessionsPage > Picker > .title {{ color: {theme.ACCENT}; }}
+    SessionsPage > Picker > .choices {{ height: 1fr; }}
+    """
+
+    def __init__(self, picker):
+        super().__init__()
+        self.picker = picker
+
+    def compose(self):
+        yield Splash()
+        yield self.picker
+
+    def on_resize(self, event):
+        self.call_after_refresh(self.fit)
+
+    def fit(self):
+        rows = max(1, self.picker.choice_view.size.height - 1)  # less the ↑/↓ more line
+        if rows != self.picker.rows:
+            self.picker.rows = rows
+            self.picker.point_at(self.picker.cursor)
+            self.picker.redraw()
+
+
 class Transcript(VerticalScroll):
     DEFAULT_CSS = "Transcript { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }"
 
@@ -1236,7 +1285,7 @@ class Transcript(VerticalScroll):
         return [w for w in self.children if isinstance(w, (Entry, DoneEntry))]
 
 
-__all__ = ["Banner", "Entry", "UserEntry", "AssistantEntry", "ThinkingEntry", "ToolEntry",
+__all__ = ["Banner", "Splash", "Entry", "UserEntry", "AssistantEntry", "ThinkingEntry", "ToolEntry",
            "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "UnqueueButton", "PromptBar", "SearchBar",
-           "PromptInput", "SuggestionMenu", "Footer", "Dialog", "Picker", "Transcript",
+           "PromptInput", "SuggestionMenu", "Footer", "Dialog", "Picker", "SessionsPage", "Transcript",
            "notice", "shortcuts", "elapsed", "quote_reply", "split_reply"]

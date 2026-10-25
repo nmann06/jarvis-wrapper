@@ -35,9 +35,9 @@ from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, 
 from .manager import MANAGER_PROMPT, SERVER, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
-                      Picker, PromptBar, PromptInput, QueuedPanel, SearchBar, SideAnswer, Spinner, SuggestionMenu,
-                      TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, quote_reply,
-                      shortcuts)
+                      Picker, PromptBar, PromptInput, QueuedPanel, SearchBar, SideAnswer, Spinner,
+                      SessionsPage, SuggestionMenu, TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice,
+                      quote_reply, shortcuts)
 
 CHORD_TIME = 2       # seconds after ctrl+x in which s sends now
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
@@ -1156,9 +1156,16 @@ class JarvisApp(App):
 
     def tick(self):
         # Follow new output once there's more than a screenful (anchoring sooner would sit
-        # the banner at the bottom); scrolling up lets go until you're back at the end.
-        if not self.transcript.is_anchored and self.transcript.max_scroll_y > 0:
-            self.transcript.anchor()
+        # the banner at the bottom); scrolling up lets go until you're back at the end. Once
+        # it all fits again (a dialog that squeezed it has closed), let go, banner at the top.
+        if self.transcript.max_scroll_y > 0:
+            if not self.transcript.is_anchored:
+                self.transcript.anchor()
+        else:
+            if self.transcript.is_anchored:
+                self.transcript.anchor(False)
+            if self.transcript.scroll_y:  # anchoring leaves it below 0, where scroll_home won't go
+                self.transcript.scroll_y = 0
         self.spinner.tick()
         self.manager_pane.tick()
         on = int(time.monotonic() * 2.5) % 2 == 0
@@ -1553,7 +1560,7 @@ class JarvisApp(App):
                     await self.stop_turn()
                 await self.submit(text)
             except Exception as e:
-                self.log.error(f"submitting {text[:40]!r}: {e!r}")
+                self.log.error(f"submitting {str(text)[:40]!r}: {e!r}")
                 await self.note(f"Jarvis hit a problem: {e}", theme.ERROR)
 
     async def submit(self, text):
@@ -1904,10 +1911,26 @@ class JarvisApp(App):
         title = f"Resume a conversation ({len(found)}, every folder)" if everywhere else "Resume a conversation"
         if new:
             title = title.replace("Resume a conversation", "Conversations", 1)
-            return await self.show_dialog(Picker(title, items, new_text="Type to start a new conversation…",
-                                                 open_on_right=True, marked=finished))
-        return await self.show_dialog(Picker(title, items, open_on_right=True, marked=finished,
-                                             hint="Type to filter · ↑↓ to scroll · Enter or → to pick · Esc to cancel"))
+            picker = Picker(title, items, new_text="Type to start a new conversation…",
+                            open_on_right=True, marked=finished)
+        else:
+            picker = Picker(title, items, open_on_right=True, marked=finished,
+                            hint="Type to filter · ↑↓ to scroll · Enter or → to pick · Esc to cancel")
+        return await self.show_page(picker)
+
+    async def show_page(self, picker):
+        """A list of conversations, on a page of its own in place of this one."""
+        self.menu.hide()
+        self.dialog, self.dialog_request = picker, None
+        page = SessionsPage(picker)
+        await self.push_screen(page)
+        try:
+            return await picker.result
+        finally:
+            self.dialog = None
+            if self.screen_stack and self.screen is page:  # not if the window is closing
+                await self.pop_screen()
+                self.prompt.focus()
 
     def show_all_sessions(self):
         """Left arrow on an empty prompt: every saved conversation, from every folder."""
