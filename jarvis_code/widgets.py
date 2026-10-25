@@ -149,7 +149,7 @@ class ThinkingEntry(Entry):
         self.done = done  # a thought from a saved conversation: how long it took isn't known
         self.expanded = verbose
         self.view = Static()
-        super().__init__("∴", f"{theme.ACCENT}", self.view)
+        super().__init__("∴", f"italic {theme.ACCENT}", self.view)
 
     def on_mount(self):
         self.redraw()
@@ -258,9 +258,9 @@ class ToolEntry(Entry):
             self.set_glyph(theme.BULLET, theme.ACCENT if on else theme.DIM)
 
     def redraw(self):
-        colour = {"running": theme.DIM, "done": theme.SUCCESS, "error": theme.ERROR,
+        colour = {"running": theme.DIM, "done": None, "error": theme.ERROR,
                   "rejected": theme.ERROR, "interrupted": theme.ERROR}[self.state]
-        self.set_glyph(theme.BULLET, colour)
+        self.set_glyph(theme.BULLET if colour else " ", colour or "")
         self.header_view.update(tools.header(self.tool_name, self.input, self.cwd,
                                              pending=not self.input_complete))
         progress = self._progress()
@@ -373,10 +373,11 @@ class Spinner(Static):
         glyph = theme.SPINNER_FRAMES[self.frame // 2 % len(theme.SPINNER_FRAMES)]
         word = (self.message or self.word).rstrip("…").rstrip(".") + "…"
         text = Text()
-        text.append(glyph + " ", style=f"bold {theme.ACCENT}")
+        text.append(glyph + " ", style=f"bold italic {theme.ACCENT}")
         light = self.frame % (len(word) + 12) - 4
         for index, char in enumerate(word):
-            text.append(char, style=f"bold {theme.SHIMMER}" if abs(index - light) <= 1 else theme.ACCENT)
+            text.append(char, style=f"bold italic {theme.SHIMMER}" if abs(index - light) <= 1
+                        else f"italic {theme.ACCENT}")
         parts = [elapsed(time.monotonic() - self.started)]
         if self.tokens:
             parts.append(f"↓ {tools.tokens(self.tokens)} tokens")
@@ -406,7 +407,7 @@ class QueuedPanel(Static):
 
     def show(self, texts):
         self.display = bool(texts)
-        self.update(Group(*(Text.assemble(("> ", theme.DIM), (" ".join(t.split())[:200], theme.DIM),
+        self.update(Group(*(Text.assemble(("> ", theme.DIM), (" ".join(t.split())[:200], f"italic {theme.DIM}"),
                                           ("  (queued)", f"italic {theme.LABEL}")) for t in texts)))
 
 
@@ -425,11 +426,12 @@ class PromptInput(TextArea):
     \\+Enter, ctrl+j or alt+enter start a new line; the arrows walk
     the suggestion menu when it's open and the prompt history at the first or last line."""
 
-    DEFAULT_CSS = """
-    PromptInput { height: auto; max-height: 12; border: none; padding: 0; background: transparent; }
-    PromptInput:focus { border: none; }
-    PromptInput .text-area--cursor-line { background: transparent; }
-    PromptInput:ansi .text-area--cursor { text-style: none; }  /* a solid $input-cursor-background block */
+    DEFAULT_CSS = f"""
+    PromptInput {{ height: auto; max-height: 12; border: none; padding: 0; background: transparent; }}
+    PromptInput:focus {{ border: none; }}
+    PromptInput .text-area--cursor-line {{ background: transparent; }}
+    PromptInput .text-area--placeholder {{ color: {theme.DIM}; text-style: italic; }}
+    PromptInput:ansi .text-area--cursor {{ text-style: none; }}  /* a solid $input-cursor-background block */
     """
 
     class Submitted(Message):

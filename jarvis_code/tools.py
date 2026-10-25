@@ -119,7 +119,8 @@ def header(name, tool_input, cwd, pending=False):
     text = Text(label, style="bold")
     if arg or pending:
         text.append("(")
-        text.append(arg if arg else "…", style="" if arg else theme.DIM)
+        style = ("italic" if name == "Bash" else "") if arg else theme.DIM
+        text.append(arg if arg else "…", style=style)
         text.append(")")
     return text
 

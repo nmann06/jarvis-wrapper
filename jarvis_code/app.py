@@ -1102,7 +1102,7 @@ class JarvisApp(App):
         question = "Do you want to proceed?"
         rows = []
         if name == "Bash":
-            rows = [Text(tool_input.get("command", ""), style="bold")]
+            rows = [Text(tool_input.get("command", ""), style="bold italic")]
             if tool_input.get("description"):
                 rows.append(Text(tool_input["description"], style=theme.DIM))
         elif name in ("Edit", "MultiEdit"):
