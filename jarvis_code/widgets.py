@@ -125,6 +125,26 @@ class Entry(Horizontal):
         return ""
 
 
+def quote_reply(quoted, text):
+    """A prompt replying to text picked out with ctrl+r: the text quoted above it, Markdown-style."""
+    return "\n".join(f"> {line}" for line in quoted.splitlines()) + "\n\n" + text
+
+
+def split_reply(text):
+    """(the quoted text, the rest) of a prompt quote_reply made; (None, text) for any other."""
+    lines = text.split("\n")
+    n = 0
+    while n < len(lines) and lines[n].startswith(">"):
+        n += 1
+    if n == 0 or n + 1 >= len(lines) or lines[n] != "":
+        return None, text
+    return "\n".join(line[2:] if line.startswith("> ") else line[1:] for line in lines[:n]), "\n".join(lines[n + 1:])
+
+
+def one_line(text):
+    return " ".join(text.split())
+
+
 class UserEntry(Entry):
     DEFAULT_CSS = f"""
     UserEntry {{ background: {theme.USER_BG}; padding-right: 1; }}
@@ -134,7 +154,12 @@ class UserEntry(Entry):
 
     def __init__(self, text, glyph=">", glyph_style=theme.DIM):
         self.text = text
-        super().__init__(glyph, glyph_style, Static(Text(text), markup=False))
+        quoted, said = split_reply(text) if glyph == ">" else (None, text)
+        body = Text(said)
+        if quoted:  # a reply: what it replies to, in grey on one line above it
+            line = Text(one_line(quoted), style=theme.DIM, no_wrap=True, overflow="ellipsis")
+            body = Group(line, body)
+        super().__init__(glyph, glyph_style, Static(body, markup=False))
 
     def plain(self):
         return f"> {self.text}"
@@ -170,7 +195,7 @@ class AssistantEntry(Entry):
 
 
 class ThinkingEntry(Entry):
-    """∴ Thinking…, folded to one line; ctrl+o (or a click) shows what was thought."""
+    """∴ Thought for 3s, folded to one line; ctrl+o (or a click) shows what was thought."""
 
     def __init__(self, text="", verbose=False, done=False):
         self.text = text
@@ -182,6 +207,13 @@ class ThinkingEntry(Entry):
         self.view = Static()
         self.collapse_button = CollapseButton()
         super().__init__("∴", f"italic {theme.ACCENT}", Vertical(self.view, self.collapse_button))
+        self.display = self.shown
+
+    @property
+    def shown(self):
+        """While it thinks the spinner says so; the entry turns up once it's done (or as it
+        goes, with ctrl+o)."""
+        return self.done or self.expanded
 
     def on_mount(self):
         self.redraw()
@@ -214,6 +246,7 @@ class ThinkingEntry(Entry):
         self.redraw()
 
     def redraw(self):
+        self.display = self.shown
         self.collapse_button.display = self.opened and bool(self.text.strip())
         if not self.done:
             label = Text("Thinking…", style=f"italic {theme.ACCENT}")
@@ -545,7 +578,7 @@ class QueuedPanel(Vertical):
         for n, (message_uuid, text) in enumerate(items):
             hint = "  ✕ ctrl+q" if n == len(items) - 1 else "  ✕"
             rows.append(Horizontal(
-                Static(Text.assemble(("> ", theme.DIM), (" ".join(text.split())[:200], f"italic {theme.DIM}"),
+                Static(Text.assemble(("> ", theme.DIM), (one_line(split_reply(text)[1])[:200], f"italic {theme.DIM}"),
                                      ("  (queued)", f"italic {theme.LABEL}")), classes="queued-text"),
                 UnqueueButton(hint, message_uuid)))
         with self.app.batch_update():
@@ -593,8 +626,21 @@ class SideAnswer(Static):
 class HRule(Static):
     DEFAULT_CSS = f"HRule {{ height: 1; color: {theme.LABEL}; }}"
 
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.label = ""  # grey text near the left end of the rule
+
+    def set_label(self, label):
+        self.label = one_line(label)
+        self.refresh()
+
     def render(self):
-        return "─" * max(1, self.size.width)
+        width = max(1, self.size.width)
+        if not self.label or width < 8:
+            return "─" * width
+        label = Text(self.label, style=theme.DIM)
+        label.truncate(min(width - 4, width * 2 // 3), overflow="ellipsis")  # still reads as a rule
+        return Text.assemble("── ", label, " " + "─" * (width - 4 - label.cell_len))
 
 
 class PromptInput(TextArea):
@@ -711,9 +757,10 @@ class PromptBar(Vertical):
         super().__init__(**kw)
         self.input = PromptInput(id="prompt")
         self.mark = Static(">", id="prompt-mark")
+        self.top = HRule()
 
     def compose(self):
-        yield HRule()
+        yield self.top
         with Horizontal():
             yield self.mark
             yield self.input
@@ -722,6 +769,10 @@ class PromptBar(Vertical):
     def set_bash(self, on):
         self.set_class(on, "bash")
         self.mark.update("!" if on else ">")
+
+    def set_reply(self, quoted):
+        """What the next prompt replies to (ctrl+r), shown on the rule above it; None for nothing."""
+        self.top.set_label(quoted or "")
 
     def set_mode(self, mode):
         for name in theme.MODE_LOOK:
@@ -819,7 +870,7 @@ SHORTCUTS = [
     ("ctrl+c twice to exit", "ctrl+g to edit in $EDITOR"),
     ("ctrl+x s to send now", "← for conversations"),
     ("ctrl+q to unqueue the last prompt", "alt+↑ / alt+↓ to jump between your messages"),
-    ("→ for the threads of /manager", ""),
+    ("→ for the threads of /manager", "ctrl+r to reply to the highlighted text"),
 ]
 
 
@@ -1100,4 +1151,4 @@ class Transcript(VerticalScroll):
 __all__ = ["Banner", "Entry", "UserEntry", "AssistantEntry", "ThinkingEntry", "ToolEntry",
            "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "UnqueueButton", "PromptBar",
            "PromptInput", "SuggestionMenu", "Footer", "Dialog", "Picker", "Transcript",
-           "notice", "shortcuts", "elapsed"]
+           "notice", "shortcuts", "elapsed", "quote_reply", "split_reply"]

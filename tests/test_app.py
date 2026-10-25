@@ -388,6 +388,19 @@ async def test_agent_and_thinking(home):
         assert thought.expanded and "391" in text_of(thought.view.content)
 
 
+async def test_thinking_shows_once_it_is_done(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        thought = await app.add(ThinkingEntry())  # mid-thought: only the spinner says so
+        await pilot.pause()
+        assert not thought.display
+        thought.finish("Hmm.")
+        assert thought.display and "Thought for 1s" in text_of(thought.view.content)
+        await app.add(live := ThinkingEntry(verbose=True))  # with ctrl+o on, it streams in as it goes
+        assert live.display
+
+
 async def test_bash_permission_and_folded_output(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
@@ -616,6 +629,19 @@ async def test_tab_title_is_what_the_conversation_is_about(home):
         assert sessions.list_sessions(str(home))[0].title == "Notes About Alpha"
 
 
+async def test_tab_title_ticks_when_a_turn_finishes(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        assert app.title_shown in (None, "Jarvis")
+        await send(pilot, "hello")
+        await until(pilot, lambda: not app.busy and replies(app))
+        assert app.title_shown.startswith("✓ ")
+        app.prompt.set_text("t")  # typing again: seen
+        await pilot.pause()
+        assert not app.title_shown.startswith("✓")
+
+
 async def test_tab_title_uses_a_saved_title(home):
     save_session(home, home, "s2", "hello there", [{"type": "custom-title", "customTitle": "Greeting", "sessionId": "s2"}])
     app = make(home, resume="s2")
@@ -751,6 +777,33 @@ async def test_usage_keeps_up_with_other_windows_and_the_5_hour_reset(home, monk
         await until(pilot, lambda: "limit reached" not in app.footer.right)  # dropped once its reset passed
 
 
+async def test_default_usage_sets_the_effort_new_windows_start_with(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/default-usage medium")  # this window switches too
+        await until(pilot, lambda: any(m.get("message", {}).get("content") == "/effort medium" for m in sent(home)))
+        await until(pilot, lambda: not app.busy)
+        await send(pilot, "/default-usage max")  # not on this window's model: only new windows
+        await until(pilot, lambda: json.loads((home / "jarvis-window.json").read_text()) == {"default_effort": "max"})
+        assert not any(m.get("message", {}).get("content") == "/effort max" for m in sent(home))
+        await send(pilot, "/default-usage loud")
+        await until(pilot, lambda: (app.footer.flash_text or "").startswith("Usage: /default-usage"))
+        await send(pilot, "/default-usage")  # no level: a picker
+        await until(pilot, lambda: app.dialog is not None)
+        assert "max  (default)" in text_of(app.dialog.choice_view.content)
+        await pilot.press("escape")
+        await until(pilot, lambda: app.dialog is None)
+    assert make(home).effort_override == "max"  # a new window starts on it
+    assert make(home, effort="low").effort_override == "low"  # --effort still wins
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/default-usage off")
+        await until(pilot, lambda: json.loads((home / "jarvis-window.json").read_text()) == {"default_effort": None})
+    assert make(home).effort_override is None
+
+
 async def test_keepitgoin_carries_on_when_the_usage_limit_resets(home):
     prompts = lambda: [m["message"]["content"] for m in sent(home) if m.get("type") == "user"]
     app = make(home)
@@ -838,6 +891,38 @@ async def test_selected_text_is_copied(home):
         app.screen.post_message(events.TextSelected())
         await pilot.pause()
         assert app.clipboard and app.clipboard.strip() in reply.text
+
+
+async def test_ctrl_r_replies_to_the_highlighted_text(home):
+    from textual import events
+    from textual.selection import Selection
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await pilot.press("ctrl+r")
+        assert app.reply is None and app.footer.flash_text == "Highlight some text to reply to it"
+        await send(pilot, "hello")
+        await until(pilot, lambda: not app.busy and replies(app))
+        reply = entries(app, AssistantEntry)[-1]
+        target = next(w for w in reply.walk_children()
+                      if w.allow_select and "Hello" in str((w.get_selection(Selection(None, None)) or [""])[0]))
+        app.screen.selections = {target: Selection(None, None)}
+        app.screen.post_message(events.TextSelected())
+        await pilot.pause()
+        quoted = app.screen.get_selected_text().strip()
+        await pilot.press("ctrl+r")
+        assert app.reply == quoted and not app.screen.selections and app.prompt.has_focus
+        assert quoted.split()[0] in app.prompt_bar.top.render().plain
+        await send(pilot, "why?")
+        await until(pilot, lambda: len(entries(app, UserEntry)) == 2)
+        assert app.reply is None and app.prompt_bar.top.render() == "─" * app.prompt_bar.top.size.width
+        mine = entries(app, UserEntry)[-1]
+        assert mine.text == "\n".join(f"> {line}" for line in quoted.splitlines()) + "\n\nwhy?"
+        assert text_of(mine.body.content).splitlines()[:2] == [" ".join(quoted.split())[:100].rstrip(), "why?"]
+        await until(pilot, lambda: any(m.get("message", {}).get("content") == mine.text for m in sent(home)))
+        app.set_reply("something")
+        await pilot.press("escape")
+        assert app.reply is None  # esc drops a reply on an empty prompt
 
 
 async def test_ctrl_x_s_works_whatever_has_focus(home):

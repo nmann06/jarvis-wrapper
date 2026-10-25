@@ -36,7 +36,8 @@ from .manager import MANAGER_PROMPT, SERVER, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
                       Picker, PromptBar, PromptInput, QueuedPanel, SideAnswer, Spinner, SuggestionMenu,
-                      TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, shortcuts)
+                      TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, quote_reply,
+                      shortcuts)
 
 CHORD_TIME = 2       # seconds after ctrl+x in which s sends now
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
@@ -65,11 +66,16 @@ on. Answer it directly and briefly from what is already in the conversation. You
 for this reply, and neither the question nor your answer will be kept in the conversation."""
 BTW_TIMEOUT = 180
 
+EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+EFFORT_ABOUT = {"low": "Quick, straightforward", "medium": "Balanced", "high": "Thorough",
+                "xhigh": "Very thorough", "max": "Deepest reasoning; slow and uses more of your plan"}
+
 LOCAL_COMMANDS = {
     "help": "Show commands and shortcuts",
     "resume": "Resume an earlier conversation",
     "model": "Choose the model",
     "effort": "Choose the effort level",
+    "default-usage": "Choose the effort new windows start with (/default-usage <level>, or off)",
     "usage": "Show session cost, plan usage, and what's using it",
     "status": "Show the version, account, model and MCP servers",
     "config": "Change Claude Code's settings (or /config key=value)",
@@ -87,7 +93,7 @@ LOCAL_COMMANDS = {
     "exit": "Exit Jarvis",
 }
 ALIASES = {"quit": "exit", "q": "exit", "new": "clear", "reset": "clear", "continue": "resume",
-           "cost": "usage", "cc": "claude", "settings": "config"}
+           "cost": "usage", "cc": "claude", "settings": "config", "default-effort": "default-usage"}
 SETTINGS_TABS = {"usage": "usage", "status": "status", "config": "config", "stats": "stats"}
 # Claude Code screens with no headless form; /claude opens them on the same conversation.
 ONLY_IN_CLAUDE = {"login", "logout", "plugin", "plugins", "permissions", "allowed-tools", "hooks",
@@ -371,7 +377,7 @@ class JarvisApp(App):
 
     def window_key(self, key):
         """Keys taken before whatever has focus sees them (the transcript or a dialog may have
-        it): ctrl+x s, ctrl+q (Textual's quit otherwise), alt+up and alt+down. True if taken."""
+        it): ctrl+x s, ctrl+q (Textual's quit otherwise), alt+up and alt+down, ctrl+r. True if taken."""
         if self.chord_until and not is_modifier(key):
             pending, self.chord_until = time.monotonic() < self.chord_until, 0.0
             if pending and key in ("s", "ctrl+s"):
@@ -390,6 +396,9 @@ class JarvisApp(App):
         if key in ("alt+up", "alt+down") and self.dialog is None:
             self.jump_to_prompt(-1 if key == "alt+up" else 1)
             return True
+        if key == "ctrl+r" and self.dialog is None:
+            self.reply_to_selection()
+            return True
         return False
 
     def __init__(self, options: Options):
@@ -407,7 +416,7 @@ class JarvisApp(App):
         self.model = None
         self.effort = None
         self.model_override = options.model
-        self.effort_override = options.effort
+        self.effort_override = options.effort or load_setting("default_effort", None)  # /default-usage
         self.busy = False
         self.interrupting = False
         self.turn_started = 0.0
@@ -427,6 +436,7 @@ class JarvisApp(App):
         self.capabilities = set()  # what Claude Code says it can do, on system/init
         self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
         self.jumped = None   # the message of yours alt+up / alt+down last scrolled to
+        self.reply = None    # the highlighted text the next prompt replies to (ctrl+r)
         self.pending_context = []  # ! output that goes along with the next prompt
         self.history = []
         self.history_index = -1
@@ -444,6 +454,8 @@ class JarvisApp(App):
         self.session_ends = None          # when the 5-hour usage window resets (epoch seconds)
         self.usage = {}                   # % of the plan used: {"five_hour": 13, "seven_day": 28}
         self.tab_title = None             # the terminal tab's title: what the conversation is about
+        self.finished = False             # a turn ended and you haven't typed since: ✓ in the tab's title
+        self.title_shown = None           # the title as last written to the terminal
         self.titled = None                # the session a title was looked for (once each)
         self.file_index = files.FileIndex(self.cwd)
         self.permission_queue = None
@@ -1093,6 +1105,7 @@ class JarvisApp(App):
     # Turns ----------------------------------------------------------------------------------
 
     def begin_turn(self):
+        self.set_finished(False)
         self.busy = True
         self.interrupting = False
         self.turn_started = time.monotonic()
@@ -1102,6 +1115,8 @@ class JarvisApp(App):
         self.refresh_tasks()
 
     def end_turn(self):
+        if self.busy:
+            self.set_finished(True)
         self.busy = False
         self.interrupting = False
         self.turn_started = 0.0
@@ -1447,6 +1462,9 @@ class JarvisApp(App):
             self.history.remove(text)
         self.history.insert(0, text)
         sessions.add_history(text, self.cwd, self.session_id)
+        if self.reply and not text.strip().startswith(("/", "!")):  # a command keeps the reply for the next prompt
+            text = quote_reply(self.reply, text)
+            self.set_reply(None)
         self.submissions.put_nowait((text, event.now))
 
     def send_queued_now(self):
@@ -1572,6 +1590,8 @@ class JarvisApp(App):
         if event.text_area is not self.prompt:
             return
         text = self.prompt.text
+        if text:
+            self.set_finished(False)  # you're back at it: the tab's ✓ has been seen
         if self.history_index >= 0 and text != self.history[self.history_index]:
             self.history_index = -1  # typing after the arrows starts a new prompt
         self.prompt_bar.set_bash(text.startswith("!"))
@@ -1682,6 +1702,8 @@ class JarvisApp(App):
             await self.cmd_model()
         elif name == "effort" and not args:
             await self.cmd_effort()
+        elif name == "default-usage":
+            await self.cmd_default_effort(args)
         elif name in SETTINGS_TABS and not (name == "config" and args):
             await self.show_dialog(SettingsPanel(SETTINGS_TABS[name]))
         elif name == "config":
@@ -1985,7 +2007,16 @@ class JarvisApp(App):
         self.tab_title = title
         if title is None:
             self.titled = None
-        clean = re.sub(r"[\x00-\x1f\x7f]", "", title or "Jarvis")
+        self.show_tab_title()
+
+    def set_finished(self, finished):
+        if finished != self.finished:
+            self.finished = finished
+            self.show_tab_title()
+
+    def show_tab_title(self):
+        clean = re.sub(r"[\x00-\x1f\x7f]", "", ("✓ " if self.finished else "") + (self.tab_title or "Jarvis"))
+        self.title_shown = clean
         driver = getattr(self, "_driver", None)
         if sys.stdout.isatty():
             if driver is not None:
@@ -2023,18 +2054,40 @@ class JarvisApp(App):
         if value:
             await self.run_engine_command(f"/model {value}")
 
-    async def cmd_effort(self):
-        levels = ["low", "medium", "high", "xhigh", "max"]
+    def effort_levels(self):
         for m in self.models:
             if m.get("resolvedModel") == self.model and m.get("supportedEffortLevels"):
-                levels = m["supportedEffortLevels"]
-                break
-        about = {"low": "Quick, straightforward", "medium": "Balanced", "high": "Thorough",
-                 "xhigh": "Very thorough", "max": "Deepest reasoning; slow and uses more of your plan"}
-        items = [(level, level + ("  (current)" if level == self.effort else ""), about.get(level, ""))
-                 for level in levels]
+                return m["supportedEffortLevels"]
+        return EFFORT_LEVELS
+
+    async def cmd_effort(self):
+        items = [(level, level + ("  (current)" if level == self.effort else ""), EFFORT_ABOUT.get(level, ""))
+                 for level in self.effort_levels()]
         value = await self.show_dialog(Picker("Choose an effort level", items))
         if value:
+            await self.run_engine_command(f"/effort {value}")
+
+    async def cmd_default_effort(self, args):
+        """/default-usage: the effort new windows start with (saved; --effort still overrides
+        it), and this window's too."""
+        saved = load_setting("default_effort", None)
+        value = args.lower()
+        if not value:
+            items = [(level, level + ("  (default)" if level == saved else ""), EFFORT_ABOUT.get(level, ""))
+                     for level in EFFORT_LEVELS]  # every level: a new window may be on another model
+            items.append(("off", "off" + ("" if saved else "  (default)"), "Whatever Claude Code itself starts on"))
+            value = await self.show_dialog(Picker("Choose the effort new windows start with", items))
+            if not value:
+                return
+        if value not in EFFORT_LEVELS + ["off"]:
+            self.footer.flash(f"Usage: /default-usage <{'|'.join(EFFORT_LEVELS)}|off>", 3)
+            return
+        save_setting("default_effort", None if value == "off" else value)
+        if value == "off":
+            await self.note("New windows start on Claude Code's own effort level.")
+            return
+        await self.note(f"New windows start on {value} effort.")
+        if value != self.effort and value in self.effort_levels():
             await self.run_engine_command(f"/effort {value}")
 
     # Data for the menus (panels.py) -------------------------------------------------------------
@@ -2298,6 +2351,9 @@ class JarvisApp(App):
         if self.busy:
             self.run_worker(self.interrupt(), group="interrupt")
             return
+        if self.reply and not self.prompt.text:
+            self.set_reply(None)
+            return
         if self.prompt.text:
             now = time.monotonic()
             if now - self.last_escape < 0.8:
@@ -2372,6 +2428,20 @@ class JarvisApp(App):
         self.jumped = prompts[index]
         self.jumped.add_class("picked")
         self.transcript.scroll_to_widget(self.jumped, top=True, animate=False)
+
+    def reply_to_selection(self):
+        """ctrl+r: the next prompt replies to the text highlighted in the conversation."""
+        selected = (self.screen.get_selected_text() or "").strip()
+        if not selected:
+            self.footer.flash("Highlight some text to reply to it")
+            return
+        self.screen.clear_selection()
+        self.set_reply(selected)
+        self.prompt.focus()
+
+    def set_reply(self, quoted):
+        self.reply = quoted
+        self.prompt_bar.set_reply(quoted)
 
     def unjump(self):
         if self.jumped is not None:

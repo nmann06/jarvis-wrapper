@@ -62,7 +62,8 @@ THREAD_LOOK = {
 
 BULLET = "●"
 RESULT = "⎿"
-SPINNER_FRAMES = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"]
+# No ✳ (U+2733): many terminals draw it as the green ✳️ emoji.
+SPINNER_FRAMES = ["·", "✢", "✶", "✻", "✽", "✽", "✻", "✶", "✢", "·"]
 
 VERBS = [
     "Analysing", "Assembling", "Calculating", "Calibrating", "Charging the arc reactor",
