@@ -28,6 +28,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "sent.jsonl"))
     monkeypatch.setattr(app_module, "SETTINGS", str(tmp_path / "jarvis-window.json"))
     monkeypatch.setattr(sessions, "MANAGERS", str(tmp_path / "jarvis-manager"))
+    monkeypatch.setattr(sessions, "FINISHED", str(tmp_path / "jarvis-finished.json"))
     (tmp_path / "notes.txt").write_text("alpha\n")
     return tmp_path
 
@@ -573,6 +574,25 @@ async def test_a_manager_conversation_reopens_with_its_threads(home):
         await until(pilot, lambda: app.manager is None and not app.busy)
         assert sessions.load_manager(coordinator) == []
         assert {s.id for s in sessions.list_sessions(str(home))} == {coordinator, "plain1", *workers}
+
+
+async def test_finished_marks_the_conversation_in_the_list(home):
+    save_session(home, home, "s1", "fix the buck converter")
+    save_session(home, home, "s2", "plan the lab")
+    app = make(home, resume="s1")
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/finished")
+        await until(pilot, lambda: sessions.finished_sessions() == {"s1"})
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        about = {item[0]: item[2] for item in app.dialog.shown}
+        assert about["s1"].startswith("✓ finished · ") and "✓" not in about["s2"]
+        await pilot.press("escape")
+        await until(pilot, lambda: app.dialog is None)
+        await send(pilot, "/finished off")
+        await until(pilot, lambda: sessions.finished_sessions() == set())
+        assert not any(s.finished for s in sessions.list_sessions(str(home)))
 
 
 async def test_left_arrow_in_text_moves_the_cursor(home):

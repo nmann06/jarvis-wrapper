@@ -80,6 +80,7 @@ LOCAL_COMMANDS = {
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
     "btw": "Ask a quick side question without interrupting or adding to the conversation",
     "manager": "Project manager mode: Jarvis hands the work to worker Jarvises (/manager off to stop)",
+    "finished": "Mark this conversation as finished in the list of conversations (/finished off to undo)",
     "keepitgoin": "Carry on by itself when a usage limit resets (/keepitgoin on|off; no args toggles)",
     "computer": "Show which computer this window is running on",
     "fuck": "Stop Jarvis right now, like esc",
@@ -1699,6 +1700,8 @@ class JarvisApp(App):
             await self.cmd_manager(args)
         elif name == "keepitgoin":
             await self.cmd_keep_going(args)
+        elif name == "finished":
+            await self.cmd_finished(args)
         elif name == "computer":
             await self.note(f"Running on {platform.node()} ({platform.system()} {platform.release()})")
         elif name in ONLY_IN_CLAUDE and name not in self.commands:
@@ -1858,6 +1861,8 @@ class JarvisApp(App):
 
         def about(s):
             parts = [sessions.time_ago(s.modified), f"{s.prompts} prompt{'s' if s.prompts != 1 else ''}"]
+            if s.finished:
+                parts.insert(0, "✓ finished")
             if everywhere and s.cwd:
                 parts.append(tools.short_path(s.cwd, None))
             if s.branch:
@@ -1899,6 +1904,17 @@ class JarvisApp(App):
         sessions.add_history(text, self.cwd, None)
         if await self.start_engine():
             await self.submit(text)
+
+    async def cmd_finished(self, args):
+        """/finished: mark this conversation done, shown so in the list; /finished off undoes it."""
+        if not self.session_id:
+            await self.note("There's no conversation to mark yet.")
+            return
+        undo = args.strip().lower() in ("off", "undo", "no")
+        await asyncio.to_thread(sessions.set_finished, self.session_id, not undo)
+        await self.note("This conversation is no longer marked finished." if undo else
+                        "Marked this conversation as finished: the list of conversations shows it so. "
+                        "/finished off undoes it.")
 
     async def cmd_resume(self, args):
         session_id = args or await self.pick_session()

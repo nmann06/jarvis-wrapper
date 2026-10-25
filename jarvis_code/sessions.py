@@ -5,6 +5,7 @@ Conversations: ~/.claude/projects/<project>/<session-id>.jsonl, one record per l
 Prompt history: ~/.claude/history.jsonl, one line per prompt, tagged with its project.
 /manager's threads: ~/.claude/jarvis-manager/<coordinator's session-id>.json, so reopening a
 conversation that was in manager mode brings its threads back.
+Conversations marked with /finished: ~/.claude/jarvis-finished.json, a list of session ids.
 """
 
 import json
@@ -17,6 +18,7 @@ CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 HISTORY = os.path.join(CLAUDE_DIR, "history.jsonl")
 MANAGERS = os.path.join(CLAUDE_DIR, "jarvis-manager")
+FINISHED = os.path.join(CLAUDE_DIR, "jarvis-finished.json")
 
 PASTED = re.compile(r"\[Pasted text #(\d+)(?: \+\d+ lines)?\]")
 NOT_A_PROMPT = ("<command-", "<local-command-", "<bash-", "<system-reminder>", "Caveat:",
@@ -37,6 +39,7 @@ class Session:
     branch: str
     cwd: str = ""  # the folder it ran in
     manager: bool = False  # it was in /manager mode: its threads come back with it
+    finished: bool = False  # marked done with /finished
 
 
 def prompt_text(message):
@@ -101,6 +104,7 @@ def _sessions(paths, limit):
     and /manager's threads (they come back with their coordinator's conversation)."""
     found = []
     managers, threads = manager_sessions()
+    finished = finished_sessions()
     for path in sorted(paths, key=_mtime, reverse=True):
         if limit is not None and len(found) >= limit:
             break
@@ -115,7 +119,8 @@ def _sessions(paths, limit):
         if prompts == 0 or continued:
             continue
         found.append(Session(session_id, path, " ".join(title.split()),
-                             modified, prompts, branch, cwd, session_id in managers))
+                             modified, prompts, branch, cwd, session_id in managers,
+                             session_id in finished))
     return found
 
 
@@ -219,6 +224,32 @@ def load_conversation(path):
             elif kind == "system" and record.get("subtype") == "compact_boundary":
                 messages.append({"type": "system", "subtype": "compact_boundary", "_history": True})
     return messages
+
+
+# /finished ---------------------------------------------------------------------------------
+
+def finished_sessions():
+    """Session ids of the conversations marked finished."""
+    try:
+        with open(FINISHED) as f:
+            ids = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+
+
+def set_finished(session_id, finished=True):
+    ids = finished_sessions()
+    if finished:
+        ids.add(session_id)
+    else:
+        ids.discard(session_id)
+    try:
+        with open(FINISHED + ".tmp", "w") as f:
+            json.dump(sorted(ids), f)
+        os.replace(FINISHED + ".tmp", FINISHED)
+    except OSError:
+        pass
 
 
 # /manager's threads ---------------------------------------------------------------------
