@@ -519,6 +519,7 @@ class JarvisApp(App):
             if path:
                 resume = os.path.basename(path)[:-6]
                 await self.show_history(path)
+                await self.reopen_manager(resume)
             else:
                 await self.note(f"No conversation {resume} found; starting a new one.", theme.ERROR)
                 resume = None
@@ -1783,12 +1784,32 @@ class JarvisApp(App):
             self.footer.flash("Project manager mode isn't on")
             return
         await self.stop_turn()
-        manager, self.manager = self.manager, None
-        await manager.close()
-        self.manager_pane.display = False
+        await self.close_manager()
+        if self.session_id:  # a plain conversation again: its threads aren't kept for it
+            sessions.save_manager(self.session_id, [])
         await self.stop_engine()
         await self.start_engine(resume=self.session_id)
         await self.note("Project manager mode is off; its threads are stopped.")
+
+    async def close_manager(self):
+        """Stop the threads and close the pane; what was saved of them stays."""
+        if self.manager is not None:
+            manager, self.manager = self.manager, None
+            await manager.close()
+            self.manager_pane.display = False
+
+    async def reopen_manager(self, session_id):
+        """A conversation that was in manager mode: its threads back on the right as they were,
+        each picked up again when it's next messaged. Call before the coordinator starts."""
+        saved = await asyncio.to_thread(sessions.load_manager, session_id)
+        if not saved:
+            return
+        self.manager = Manager(self, self.manager_pane)
+        self.manager_pane.display = True
+        await self.manager.restore(saved)
+        count = len(self.manager.threads)
+        await self.note(f"Project manager mode, with its {count} thread{'s' if count != 1 else ''} on the right. "
+                        "→ on an empty prompt goes to them; /manager off stops them.")
 
     def show_threads(self):
         """Right arrow on an empty prompt in manager mode: the threads."""
@@ -1843,7 +1864,8 @@ class JarvisApp(App):
                 parts.append(f"⎇ {s.branch}")
             return " · ".join(parts)
 
-        items = [(s.id, tools.one_line(s.title, 70), about(s)) for s in found]
+        items = [(s.id, tools.one_line(f"Manager mode · {s.title}" if s.manager else s.title, 70), about(s))
+                 for s in found]
         title = f"Resume a conversation ({len(found)}, every folder)" if everywhere else "Resume a conversation"
         if new:
             title = title.replace("Resume a conversation", "Conversations", 1)
@@ -1867,6 +1889,7 @@ class JarvisApp(App):
     async def new_session(self, text):
         """A new conversation, in this folder, started with text."""
         await self.stop_engine()
+        await self.close_manager()
         await self.clear_transcript()
         self.set_tab_title(None)
         self.history_index = -1
@@ -1888,12 +1911,14 @@ class JarvisApp(App):
             await self.note(f"No conversation {session_id} found.", theme.ERROR)
             return
         await self.stop_engine()
+        await self.close_manager()
         await self.clear_transcript()
         cwd = sessions.summarize(path)[4]
         if cwd and cwd != self.cwd and os.path.isdir(cwd):
             self.change_dir(cwd)  # Claude Code resumes a conversation from the folder it ran in
             await self.note(f"Now in {tools.short_path(cwd, None)}")
         await self.show_history(path)
+        await self.reopen_manager(os.path.basename(path)[:-6])
         self.set_tab_title(None)
         if await self.start_engine(resume=os.path.basename(path)[:-6]):
             self.name_conversation()

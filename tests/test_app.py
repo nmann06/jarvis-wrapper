@@ -27,6 +27,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions, "PROJECTS", str(tmp_path / "projects"))
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "sent.jsonl"))
     monkeypatch.setattr(app_module, "SETTINGS", str(tmp_path / "jarvis-window.json"))
+    monkeypatch.setattr(sessions, "MANAGERS", str(tmp_path / "jarvis-manager"))
     (tmp_path / "notes.txt").write_text("alpha\n")
     return tmp_path
 
@@ -521,6 +522,57 @@ async def test_left_arrow_lists_every_session_and_resumes_in_its_folder(home, mo
                     and [e.text for e in entries(app, UserEntry)] == ["plan the buck converter"])
         assert app.session_id == "away1" and app.cwd == str(other)
         assert os.path.realpath(os.getcwd()) == os.path.realpath(other)
+
+
+async def test_a_manager_conversation_reopens_with_its_threads(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager delegate the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2
+                    and app.manager.threads[0].look == "done" and app.manager.threads[1].look == "attention")
+        coordinator = app.session_id
+        workers = [t.session for t in app.manager.threads]
+        reply = app.manager.threads[0].reply
+        assert all(workers) and reply and coordinator not in workers
+    # Claude Code keeps each conversation (the fake doesn't): the coordinator's and the threads'.
+    save_session(home, home, coordinator, "delegate the work")
+    save_session(home, home, workers[0], "hello", [{"type": "assistant", "message": {
+        "id": "m1", "role": "assistant", "content": [{"type": "text", "text": "Hello, sir. How may I help?"}]}}])
+    save_session(home, home, workers[1], "edit the notes")
+    save_session(home, home, "plain1", "what's the weather")
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        shown = {item[0]: item[1] for item in app.dialog.shown}
+        assert set(shown) == {coordinator, "plain1"}  # the threads come back with their coordinator
+        assert shown[coordinator] == "Manager mode · delegate the work" and shown["plain1"] == "what's the weather"
+        await pilot.press(*["down"] * [item[0] for item in app.dialog.shown].index(coordinator), "enter")
+        await until(pilot, lambda: app.dialog is None and app.engine_state == "running"
+                    and app.manager is not None and len(app.manager.threads) == 2)
+        assert app.manager_pane.display and app.session_id == coordinator
+        init = [m for m in sent(home) if (m.get("request") or {}).get("subtype") == "initialize"]
+        assert init[-1]["request"].get("sdkMcpServers") == ["manager"]
+        one, two = app.manager.threads
+        assert (one.title, one.look, two.title, two.look) == ("Say hello", "done", "Edit the notes", "stopped")
+        assert one.engine is None and two.engine is None  # nothing runs until a thread is messaged
+        assert one.reply == reply and reply in app.manager_pane.list.render().renderables[1].plain
+        # Opening one draws what it did; messaging it resumes its own conversation.
+        await pilot.press("right", "enter")
+        await until(pilot, lambda: thread_replies(one) == ["Hello, sir. How may I help?"])
+        await pilot.press(*"think")
+        await pilot.press("enter")
+        await until(pilot, lambda: "It is **391**, sir." in thread_replies(one) and one.look == "done")
+        argv = [m["argv"] for m in sent(home) if "argv" in m][-1]
+        assert argv[argv.index("--resume") + 1] == workers[0]
+        # /manager off: a plain conversation again, its threads listed on their own.
+        await pilot.press("left", "left")
+        await send(pilot, "/manager off")
+        await until(pilot, lambda: app.manager is None and not app.busy)
+        assert sessions.load_manager(coordinator) == []
+        assert {s.id for s in sessions.list_sessions(str(home))} == {coordinator, "plain1", *workers}
 
 
 async def test_left_arrow_in_text_moves_the_cursor(home):

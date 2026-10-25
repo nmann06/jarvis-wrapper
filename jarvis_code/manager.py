@@ -7,6 +7,10 @@ on the right. The pane lists the threads by title, coloured by what each is doin
 finished, waiting for you); Enter or → opens one in full, with its permission prompts and
 questions, and a line to message it. When a thread the coordinator set going finishes its
 turn, the window tells the coordinator in a <thread-update> message.
+
+The threads are saved with the coordinator's conversation (sessions.save_manager): reopening
+it brings them back in the pane, each with what it did, and a thread's own conversation is
+resumed when it's next messaged.
 """
 
 import asyncio
@@ -22,7 +26,7 @@ from textual.containers import Vertical
 from textual.widget import Widget
 from textual.widgets import Input, Static
 
-from . import persona, theme, tools
+from . import persona, sessions, theme, tools
 from .engine import Engine, EngineError
 from .widgets import (AssistantEntry, DoneEntry, NoticeEntry, Spinner, ThinkingEntry, ToolEntry,
                       Transcript, UserEntry, elapsed, notice)
@@ -30,6 +34,7 @@ from .widgets import (AssistantEntry, DoneEntry, NoticeEntry, Spinner, ThinkingE
 SERVER = "manager"   # the MCP server's name: its tools are mcp__manager__*
 MAX_WORKING = 8      # threads working at once
 REPORT_LIMIT = 6000  # characters of a thread's reply put in its <thread-update>
+HISTORY_LIMIT = 300  # saved records redrawn in a reopened thread, as in the window
 
 MANAGER_PROMPT = """# Project manager mode
 This window is in project manager mode (/manager). You are the coordinator: you plan the \
@@ -132,6 +137,11 @@ class Thread:
         self.cancelled = set()
         self.dialog = self.dialog_request = None
         self.mode = None
+        self.session = None       # its Claude Code conversation, once it has one
+        self.saved = None         # reopened: its saved conversation, not yet drawn
+        self.batch = None         # entries being drawn from history, mounted together
+        self.launching = asyncio.Lock()
+        self.drawing = asyncio.Lock()
         self.view = ThreadView(self)
 
     @property
@@ -156,13 +166,18 @@ class Thread:
         self.view.redraw()
 
     async def start(self, prompt):
+        if await self.launch():
+            await self.send(prompt, from_coordinator=True)
+
+    async def launch(self):
+        """Start its Claude Code: a new conversation, or (reopened) its own one again."""
         app = self.app
         mode = app.mode if app.mode != "plan" else "default"  # a worker in plan mode can't do its task
         log = f"{app.options.log_path}.thread-{self.number}" if app.options.log_path else None
         prompt_text = (persona.PERSONA + "\n\n" if app.options.persona else "") + WORKER_PROMPT.format(title=self.title)
         self.engine = Engine(self.cwd, self.on_message, lambda rid, req: self.permissions.put_nowait((rid, req)),
                              model=self.model or app.model_override, effort=app.effort_override,
-                             permission_mode=mode if mode != "default" else None,
+                             permission_mode=mode if mode != "default" else None, resume=self.session,
                              append_system_prompt=prompt_text, thinking_display=app.options.thinking_display,
                              command=app.options.engine_command, log_path=log)
         self.mode = mode
@@ -170,10 +185,57 @@ class Thread:
             await self.engine.start()
         except (EngineError, OSError) as e:
             await self.fail(f"Couldn't start Claude Code: {e}")
-            return
-        await self.send(prompt, from_coordinator=True)
+            return False
+        return True
+
+    def restore(self, saved):
+        """Back as it was saved: finished, or stopped if the window closed on its turn."""
+        self.session = saved.get("session") or None
+        self.reply = str(saved.get("reply") or "")
+        status = saved.get("status")
+        self.status = status if status in ("done", "error", "stopped") else "stopped"
+        took = saved.get("took") if isinstance(saved.get("took"), (int, float)) else 0
+        self.ended = time.monotonic()
+        self.turn_started = self.ended - took
+        self.saved = sessions.find_session(self.cwd, self.session) if self.session else None
+
+    async def show_history(self):
+        """Draw what it did before the window closed, once: when it's opened or messaged."""
+        async with self.drawing:
+            path, self.saved = self.saved, None
+            if path:
+                await self.draw_history(path)
+
+    async def draw_history(self, path):
+        messages = await asyncio.to_thread(sessions.load_conversation, path)
+        self.batch = []
+        try:
+            if len(messages) > HISTORY_LIMIT:
+                skipped = len(messages) - HISTORY_LIMIT
+                messages = messages[-HISTORY_LIMIT:]
+                await self.add(NoticeEntry(notice(f"… {skipped} earlier records not shown"), attached=False))
+            for msg in messages:
+                text = sessions.prompt_text(msg.get("message")) if msg["type"] == "user" else None
+                if text:
+                    await self.add(UserEntry(text))
+                elif msg["type"] == "user":
+                    await self.on_user(msg)
+                elif msg["type"] == "assistant":
+                    await self.on_assistant(msg)
+            for entry in self.tools.values():
+                if entry.state == "running":
+                    entry.mark("done")
+        finally:
+            batch, self.batch = self.batch, None
+        await self.view.transcript.mount_all(batch)
+        self.view.transcript.scroll_end(animate=False)
 
     async def send(self, text, from_coordinator=False):
+        await self.show_history()
+        async with self.launching:  # a reopened thread: its Claude Code starts on the first message
+            if (self.engine is None or not self.engine.running) and self.session and not self.closing:
+                if not await self.launch():
+                    raise EngineError(f"thread {self.number} couldn't start again")
         if self.engine is None or not self.engine.running:
             raise EngineError(f"thread {self.number} isn't running")
         if not self.busy or self.status == "starting":
@@ -210,12 +272,16 @@ class Thread:
         self.view.spinner.stop()
         await self.add(NoticeEntry(notice(text, theme.ERROR), attached=False))
         self.changed()
+        self.manager.save()
         if self.for_coordinator or not self.reply:
             self.for_coordinator = False
             self.manager.report(self, text)
 
     async def add(self, widget):
-        await self.view.transcript.mount(widget)
+        if self.batch is not None:
+            self.batch.append(widget)
+        else:
+            await self.view.transcript.mount(widget)
         return widget
 
     # Messages from its Claude Code --------------------------------------------------------------
@@ -319,7 +385,10 @@ class Thread:
 
     def on_system(self, msg):
         sub = msg.get("subtype")
-        if sub in ("task_started", "task_progress"):
+        if sub == "init" and msg.get("session_id") and msg["session_id"] != self.session:
+            self.session = msg["session_id"]
+            self.manager.save()
+        elif sub in ("task_started", "task_progress"):
             entry = self.tools.get(msg.get("tool_use_id"))
             if entry is not None and entry.tool_name in ("Agent", "Task"):
                 entry.set_activity(msg.get("description") or "")
@@ -351,7 +420,9 @@ class Thread:
             if took >= 8 and msg.get("num_turns"):
                 await self.add(DoneEntry(took))
         self.interrupting = False
+        self.session = msg.get("session_id") or self.session
         self.changed()
+        self.manager.save()
         if self.for_coordinator:
             self.for_coordinator = False
             self.manager.report(self, self.reply or "(no reply)")
@@ -405,6 +476,11 @@ class Thread:
         about = self.activity if self.status == "working" else ""
         return f"{self.number}. {self.title}: {word} ({since})" + (f", {about}" if about else "")
 
+    def saved_state(self):
+        took = (self.ended or time.monotonic()) - self.turn_started
+        return {"number": self.number, "title": self.title, "model": self.model, "session": self.session,
+                "status": self.status, "reply": self.reply, "took": round(took, 1)}
+
 
 class Manager:
     """The threads of /manager, and the tools the coordinator runs them with."""
@@ -413,6 +489,22 @@ class Manager:
         self.app = app
         self.pane = pane
         self.threads = []
+        self.closed = False
+
+    def save(self):
+        """Keep the threads with the coordinator's conversation, for when it's reopened."""
+        if not self.closed and self.app.session_id and self.threads:
+            sessions.save_manager(self.app.session_id, [t.saved_state() for t in self.threads])
+
+    async def restore(self, saved):
+        """The threads of a reopened manager conversation, as they were saved."""
+        for state in sorted(saved, key=lambda t: t.get("number") or 0):
+            thread = Thread(self, len(self.threads) + 1, tools.one_line(str(state.get("title") or "Thread"), 60),
+                            state.get("model") or None)
+            thread.restore(state)
+            self.threads.append(thread)
+            await self.pane.add_thread(thread)
+            self.app.run_worker(thread.permission_loop(), group=f"thread-{thread.number}")
 
     def thread(self, number):
         try:
@@ -480,6 +572,7 @@ class Manager:
                     "<thread-update> before starting another."), True
         thread = Thread(self, len(self.threads) + 1, tools.one_line(title, 60), model)
         self.threads.append(thread)
+        self.save()
         await self.pane.add_thread(thread)
         self.app.run_worker(thread.permission_loop(), group=f"thread-{thread.number}")
         self.app.run_worker(thread.start(prompt), group=f"thread-{thread.number}")
@@ -496,7 +589,10 @@ class Manager:
         self.app.run_worker(self.app.send_update(text), group="thread-updates")
 
     async def close(self):
-        """Stop every thread (leaving manager mode, or the window closing)."""
+        """Stop every thread (leaving manager mode, another conversation, or the window
+        closing). What was saved of them stays, for reopening this conversation."""
+        self.save()
+        self.closed = True
         threads, self.threads = self.threads, []
         for thread in threads:
             self.app.workers.cancel_group(self.app, f"thread-{thread.number}")
@@ -743,6 +839,8 @@ class ManagerPane(Vertical):
         self.list.index = self.threads.index(thread)
         self.title_view.display = self.list.display = False
         thread.view.display = True
+        if thread.saved:
+            self.app.run_worker(thread.show_history(), group=f"thread-{thread.number}")
         thread.view.transcript.scroll_end(animate=False)
         thread.view.spinner.display = thread.status == "working"
         if thread.dialog is not None:

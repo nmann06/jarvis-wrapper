@@ -3,6 +3,8 @@ so /resume and the up arrow see the same things in Jarvis and in plain Claude Co
 
 Conversations: ~/.claude/projects/<project>/<session-id>.jsonl, one record per line.
 Prompt history: ~/.claude/history.jsonl, one line per prompt, tagged with its project.
+/manager's threads: ~/.claude/jarvis-manager/<coordinator's session-id>.json, so reopening a
+conversation that was in manager mode brings its threads back.
 """
 
 import json
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 HISTORY = os.path.join(CLAUDE_DIR, "history.jsonl")
+MANAGERS = os.path.join(CLAUDE_DIR, "jarvis-manager")
 
 PASTED = re.compile(r"\[Pasted text #(\d+)(?: \+\d+ lines)?\]")
 NOT_A_PROMPT = ("<command-", "<local-command-", "<bash-", "<system-reminder>", "Caveat:",
@@ -33,6 +36,7 @@ class Session:
     prompts: int
     branch: str
     cwd: str = ""  # the folder it ran in
+    manager: bool = False  # it was in /manager mode: its threads come back with it
 
 
 def prompt_text(message):
@@ -93,11 +97,16 @@ def _jsonl(directory):
 
 
 def _sessions(paths, limit):
-    """Session for each conversation file, newest first, leaving out empty and continued ones."""
+    """Session for each conversation file, newest first, leaving out empty and continued ones,
+    and /manager's threads (they come back with their coordinator's conversation)."""
     found = []
+    managers, threads = manager_sessions()
     for path in sorted(paths, key=_mtime, reverse=True):
         if limit is not None and len(found) >= limit:
             break
+        session_id = os.path.basename(path)[:-6]
+        if session_id in threads:
+            continue
         try:
             title, prompts, branch, continued, cwd = summarize(path)
             modified = os.path.getmtime(path)
@@ -105,8 +114,8 @@ def _sessions(paths, limit):
             continue
         if prompts == 0 or continued:
             continue
-        found.append(Session(os.path.basename(path)[:-6], path, " ".join(title.split()),
-                             modified, prompts, branch, cwd))
+        found.append(Session(session_id, path, " ".join(title.split()),
+                             modified, prompts, branch, cwd, session_id in managers))
     return found
 
 
@@ -210,6 +219,57 @@ def load_conversation(path):
             elif kind == "system" and record.get("subtype") == "compact_boundary":
                 messages.append({"type": "system", "subtype": "compact_boundary", "_history": True})
     return messages
+
+
+# /manager's threads ---------------------------------------------------------------------
+
+def _manager_path(session_id):
+    return os.path.join(MANAGERS, re.sub(r"[^A-Za-z0-9-]", "-", session_id) + ".json")
+
+
+def load_manager(session_id):
+    """The threads saved for a conversation in manager mode, oldest first ([] if none)."""
+    try:
+        with open(_manager_path(session_id)) as f:
+            threads = json.load(f).get("threads")
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [t for t in threads if isinstance(t, dict)] if isinstance(threads, list) else []
+
+
+def save_manager(session_id, threads):
+    """Keep a coordinator's threads (dicts: number, title, model, session, status, reply,
+    took). With none, the conversation isn't a manager one any more."""
+    path = _manager_path(session_id)
+    try:
+        if not threads:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        os.makedirs(MANAGERS, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump({"session": session_id, "threads": threads}, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def manager_sessions():
+    """(coordinators' session ids, their threads' session ids), from every saved manager."""
+    managers, threads = set(), set()
+    try:
+        names = [n for n in os.listdir(MANAGERS) if n.endswith(".json")]
+    except OSError:
+        return managers, threads
+    for name in names:
+        try:
+            with open(os.path.join(MANAGERS, name)) as f:
+                saved = json.load(f)
+            managers.add(saved["session"])
+            threads.update(t["session"] for t in saved["threads"] if t.get("session"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return managers, threads
 
 
 def time_ago(timestamp, now=None):
