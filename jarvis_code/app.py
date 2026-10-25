@@ -371,7 +371,7 @@ class JarvisApp(App):
 
     def window_key(self, key):
         """Keys taken before whatever has focus sees them (the transcript or a dialog may have
-        it): ctrl+x s, ctrl+q (Textual's quit otherwise), ctrl+[ and ctrl+]. True if taken."""
+        it): ctrl+x s, ctrl+q (Textual's quit otherwise), alt+up and alt+down. True if taken."""
         if self.chord_until and not is_modifier(key):
             pending, self.chord_until = time.monotonic() < self.chord_until, 0.0
             if pending and key in ("s", "ctrl+s"):
@@ -387,8 +387,8 @@ class JarvisApp(App):
         if key == "ctrl+q":
             self.unqueue()
             return True
-        if key in ("ctrl+left_square_bracket", "ctrl+right_square_bracket") and self.dialog is None:
-            self.jump_to_prompt(-1 if key == "ctrl+left_square_bracket" else 1)
+        if key in ("alt+up", "alt+down") and self.dialog is None:
+            self.jump_to_prompt(-1 if key == "alt+up" else 1)
             return True
         return False
 
@@ -426,7 +426,7 @@ class JarvisApp(App):
         self.manager = None  # project manager mode's threads (manager.py), when it's on
         self.capabilities = set()  # what Claude Code says it can do, on system/init
         self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
-        self.jumped = None   # the message of yours ctrl+[ / ctrl+] last scrolled to
+        self.jumped = None   # the message of yours alt+up / alt+down last scrolled to
         self.pending_context = []  # ! output that goes along with the next prompt
         self.history = []
         self.history_index = -1
@@ -2351,8 +2351,8 @@ class JarvisApp(App):
         self.transcript.scroll_end(animate=False)
 
     def jump_to_prompt(self, step):
-        """ctrl+[ (step -1) and ctrl+] (step 1): scroll to the previous or next of your messages.
-        ctrl+[ starts from the last one and ctrl+] from the first; going past the last is back
+        """alt+up (step -1) and alt+down (step 1): scroll to the previous or next of your messages.
+        alt+up starts from the last one and alt+down from the first; going past the last is back
         to the end of the conversation."""
         prompts = [e for e in self.transcript.children if isinstance(e, UserEntry) and e.display]
         if not prompts:

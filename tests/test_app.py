@@ -904,7 +904,7 @@ async def test_ctrl_q_with_nothing_queued(home):
         assert app.is_running and app.footer.flash_text == "Nothing queued"
 
 
-async def test_ctrl_brackets_jump_between_your_messages(home):
+async def test_alt_arrows_jump_between_your_messages(home):
     app = make(home)
     async with app.run_test(size=(100, 20)) as pilot:
         await ready(pilot)
@@ -917,16 +917,16 @@ async def test_ctrl_brackets_jump_between_your_messages(home):
             # at the top of the view (with the gap above it, for one after a reply's own gap)
             return entry.has_class("picked") and 0 <= entry.virtual_region.y - app.transcript.scroll_y <= 1
 
-        await pilot.press("ctrl+left_square_bracket")  # back from the end: the last one
+        await pilot.press("alt+up")  # back from the end: the last one
         await until(pilot, lambda: at(mine[2]))
-        await pilot.press("ctrl+left_square_bracket")
+        await pilot.press("alt+up")
         await until(pilot, lambda: at(mine[1]))
-        await pilot.press("ctrl+right_square_bracket")  # and forwards again
+        await pilot.press("alt+down")  # and forwards again
         await until(pilot, lambda: at(mine[2]))
-        await pilot.press("ctrl+right_square_bracket")  # past the last: back to the end
+        await pilot.press("alt+down")  # past the last: back to the end
         await until(pilot, lambda: app.jumped is None and app.transcript.scroll_y == app.transcript.max_scroll_y)
         assert not any(e.has_class("picked") for e in mine)
-        await pilot.press("ctrl+right_square_bracket")  # from the end, ctrl+] starts at the first
+        await pilot.press("alt+down")  # from the end, alt+down starts at the first
         await until(pilot, lambda: at(mine[0]))
 
 

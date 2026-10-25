@@ -818,7 +818,7 @@ SHORTCUTS = [
     ("esc esc to clear the prompt", "ctrl+t to show tasks"),
     ("ctrl+c twice to exit", "ctrl+g to edit in $EDITOR"),
     ("ctrl+x s to send now", "← for conversations"),
-    ("ctrl+q to unqueue the last prompt", "ctrl+[ / ctrl+] to jump between your messages"),
+    ("ctrl+q to unqueue the last prompt", "alt+↑ / alt+↓ to jump between your messages"),
     ("→ for the threads of /manager", ""),
 ]
 
