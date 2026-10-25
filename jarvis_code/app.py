@@ -1892,8 +1892,6 @@ class JarvisApp(App):
 
         def about(s):
             parts = [sessions.time_ago(s.modified), f"{s.prompts} prompt{'s' if s.prompts != 1 else ''}"]
-            if s.finished:
-                parts.insert(0, "✓ finished")
             if everywhere and s.cwd:
                 parts.append(tools.short_path(s.cwd, None))
             if s.branch:
@@ -1902,12 +1900,13 @@ class JarvisApp(App):
 
         items = [(s.id, tools.one_line(f"Manager mode · {s.title}" if s.manager else s.title, 70), about(s))
                  for s in found]
+        finished = {s.id for s in found if s.finished}  # a ✓ where the number goes
         title = f"Resume a conversation ({len(found)}, every folder)" if everywhere else "Resume a conversation"
         if new:
             title = title.replace("Resume a conversation", "Conversations", 1)
             return await self.show_dialog(Picker(title, items, new_text="Type to start a new conversation…",
-                                                 open_on_right=True))
-        return await self.show_dialog(Picker(title, items, open_on_right=True,
+                                                 open_on_right=True, marked=finished))
+        return await self.show_dialog(Picker(title, items, open_on_right=True, marked=finished,
                                              hint="Type to filter · ↑↓ to scroll · Enter or → to pick · Esc to cancel"))
 
     def show_all_sessions(self):

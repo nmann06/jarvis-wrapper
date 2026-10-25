@@ -599,8 +599,9 @@ async def test_finished_marks_the_conversation_in_the_list(home):
         await until(pilot, lambda: sessions.finished_sessions() == {"s1"})
         await pilot.press("left")
         await until(pilot, lambda: app.dialog is not None)
-        about = {item[0]: item[2] for item in app.dialog.shown}
-        assert about["s1"].startswith("✓ finished · ") and "✓" not in about["s2"]
+        lines = [line[2:] for line in text_of(app.dialog.choice_view.content, width=200).splitlines()]
+        assert lines[0].startswith("✓  ") and lines[1].startswith("2. plan the lab")  # ✓ in place of the number
+        assert "✓ finished" not in lines[0]
         await pilot.press("escape")
         await until(pilot, lambda: app.dialog is None)
         await send(pilot, "/finished off")

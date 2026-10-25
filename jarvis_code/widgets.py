@@ -1033,7 +1033,13 @@ class Dialog(Vertical):
                 label, description = label
             else:
                 description = ""
-            row = Text.assemble((pointer, theme.ACCENT), (f"{self.first + n + 1}. {box}{label}", style))
+            number = f"{self.first + n + 1}."
+            mark = self.mark(n)
+            if mark:  # in the number's place, as wide as it
+                row = Text.assemble((pointer, theme.ACCENT), (mark.ljust(len(number)), theme.SUCCESS),
+                                    (f" {box}{label}", style))
+            else:
+                row = Text.assemble((pointer, theme.ACCENT), (f"{number} {box}{label}", style))
             if description:
                 row.append(f"  {' '.join(description.split())}", style=theme.DIM)
             rows.append(row)
@@ -1044,6 +1050,10 @@ class Dialog(Vertical):
 
     def more(self):
         """A line under the choices about ones not shown, if any."""
+        return ""
+
+    def mark(self, n):
+        """A glyph shown instead of choice n's number, if any."""
         return ""
 
     def finish(self, value):
@@ -1118,9 +1128,10 @@ class Picker(Dialog):
     SEARCH_HINT = "Type to search · ctrl+f or Esc to stop searching · ↑↓ to scroll · Enter or → to pick"
 
     def __init__(self, title, items, hint="Type to filter · ↑↓ to scroll · Enter to pick · Esc to cancel",
-                 new_text=None, open_on_right=False):
+                 new_text=None, open_on_right=False, marked=()):
         self.all_items = items  # (value, label, description)
         self.open_on_right = open_on_right
+        self.marked = set(marked)  # values with a ✓ instead of their number (finished conversations)
         self.new_text = new_text  # placeholder of the line when it's for something new
         self.searching = new_text is None
         self.filter = Input(placeholder="Type to search…" if self.searching else new_text, compact=True)
@@ -1151,6 +1162,9 @@ class Picker(Dialog):
         self.shown = self.matches[self.first:self.first + self.ROWS]
         self.choices = [(label, d) for _, label, d in self.shown] or [("(nothing matches)", "")]
         self.index = self.cursor - self.first
+
+    def mark(self, n):
+        return "✓" if n < len(self.shown) and self.shown[n][0] in self.marked else ""
 
     def more(self):
         above, below = self.first, len(self.matches) - self.first - len(self.shown)
