@@ -3,7 +3,8 @@
 `claude -p` with stream-json both ways: user messages go in on stdin, and everything Claude
 Code does comes back on stdout as JSON lines. Each side can also send the other control
 requests: Jarvis asks to interrupt, switch permission mode or read settings; Claude Code asks
-whether it may use a tool (`can_use_tool`), which the window answers with a dialog.
+whether it may use a tool (`can_use_tool`), which the window answers with a dialog, and
+carries the MCP messages of servers the window hosts itself (`mcp_message`: the manager's tools).
 """
 
 import asyncio
@@ -57,13 +58,15 @@ class Engine:
     on_message(msg) is awaited for every line Claude Code sends that isn't an answer to one
     of our control requests, in order, ending with {"type": "_exit"} when the process goes.
     on_permission(request_id, request) is called (not awaited) for each can_use_tool request;
-    answer it with respond().
+    answer it with respond(). on_mcp(server_name, message) is awaited for each JSON-RPC
+    message to one of sdk_mcp_servers, the MCP servers hosted in this process, and returns
+    the server's reply.
     """
 
     def __init__(self, cwd, on_message, on_permission, *, model=None, effort=None,
                  permission_mode=None, resume=None, continue_last=False, fork=False,
                  append_system_prompt=None, thinking_display="summarized", add_dirs=(),
-                 command=None, log_path=None):
+                 sdk_mcp_servers=(), on_mcp=None, command=None, log_path=None):
         self.cwd = cwd
         self.on_message = on_message
         self.on_permission = on_permission
@@ -72,6 +75,8 @@ class Engine:
         self.append_system_prompt = append_system_prompt
         self.thinking_display = thinking_display
         self.add_dirs = list(add_dirs)
+        self.sdk_mcp_servers = list(sdk_mcp_servers)
+        self.on_mcp = on_mcp
         self.command = command  # replaces `claude` (tests run a fake engine)
         self.log = open(log_path, "a", buffering=1) if log_path else None
         self.proc = None
@@ -116,17 +121,23 @@ class Engine:
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, **DETACHED)
         self._tasks = [asyncio.create_task(self._read()), asyncio.create_task(self._read_stderr())]
-        self.info = await self.request("initialize", timeout=60)
+        fields = {"sdkMcpServers": self.sdk_mcp_servers} if self.sdk_mcp_servers else {}
+        self.info = await self.request("initialize", timeout=60, **fields)
         return self.info
 
     @property
     def running(self):
         return self.proc is not None and self.returncode is None
 
-    async def send(self, content):
-        """A user message: a string, or a list of content blocks."""
-        await self._write({"type": "user", "message": {"role": "user", "content": content},
-                           "parent_tool_use_id": None, "session_id": ""})
+    async def send(self, content, message_uuid=None):
+        """A user message: a string, or a list of content blocks. Given a uuid, Claude Code
+        echoes it on the message's replay, and it names the message while it waits in the
+        queue (send_now, cancel)."""
+        msg = {"type": "user", "message": {"role": "user", "content": content},
+               "parent_tool_use_id": None, "session_id": ""}
+        if message_uuid:
+            msg["uuid"] = message_uuid
+        await self._write(msg)
 
     async def request(self, subtype, timeout=30, **fields):
         """A control request; returns Claude Code's response, or raises EngineError."""
@@ -152,6 +163,18 @@ class Engine:
 
     async def interrupt(self):
         return await self.request("interrupt", timeout=10)
+
+    async def send_now(self):
+        """Have the prompts waiting in the queue reach the model now, stopping the turn in
+        progress if need be. Returns what was done: "stopped", "delivering" or
+        "nothing_waiting" (None from a Claude Code without it, which takes it as a plain
+        interrupt)."""
+        return (await self.request("interrupt", timeout=10, send_now=True)).get("send_now")
+
+    async def cancel_queued(self, message_uuid):
+        """Take a prompt back out of the queue; False if it had already been taken in."""
+        response = await self.request("cancel_async_message", timeout=10, message_uuid=message_uuid)
+        return bool(response.get("cancelled"))
 
     async def stop(self):
         if self.proc is None:
@@ -233,10 +256,29 @@ class Engine:
         if request.get("subtype") == "can_use_tool":
             self.on_permission(msg["request_id"], request)
             return
-        # Hook callbacks and SDK MCP servers belong to SDK hosts; Jarvis registers neither.
+        if request.get("subtype") == "mcp_message" and self.on_mcp is not None:
+            # Answered on the side: a tool call can take a while, and reading must go on.
+            task = asyncio.create_task(self._answer_mcp(msg["request_id"], request))
+            self._tasks.append(task)
+            task.add_done_callback(self._tasks.remove)
+            return
+        # Hook callbacks belong to SDK hosts; Jarvis registers none.
         await self._write({"type": "control_response", "response": {
             "subtype": "error", "request_id": msg.get("request_id"),
             "error": f"Jarvis doesn't handle {request.get('subtype')}"}})
+
+    async def _answer_mcp(self, request_id, request):
+        message = request.get("message") or {}
+        try:
+            reply = await self.on_mcp(request.get("server_name"), message)
+        except Exception as e:  # the server's own failure, as JSON-RPC
+            reply = {"jsonrpc": "2.0", "id": message.get("id"),
+                     "error": {"code": -32603, "message": str(e) or type(e).__name__}}
+        try:
+            await self._write({"type": "control_response", "response": {
+                "subtype": "success", "request_id": request_id, "response": {"mcp_response": reply}}})
+        except EngineError:
+            pass
 
     async def _read_stderr(self):
         while line := await self.proc.stderr.readline():

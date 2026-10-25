@@ -6,6 +6,7 @@ import asyncio
 import time
 
 from rich.console import Group
+from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -100,6 +101,8 @@ class Entry(Horizontal):
 class UserEntry(Entry):
     DEFAULT_CSS = f"""
     UserEntry {{ background: {theme.USER_BG}; padding-right: 1; }}
+    UserEntry.picked {{ background: {theme.PICKED_BG}; }}
+    UserEntry.picked > .gutter {{ color: {theme.ACCENT}; }}
     """
 
     def __init__(self, text, glyph=">", glyph_style=theme.DIM):
@@ -312,12 +315,21 @@ class ToolEntry(Entry):
 
 class NoticeEntry(Entry):
     """Lines under a ⎿ with no bullet: command output, interruptions, errors. The body is
-    a Rich renderable, or a widget (Markdown, for a command's table)."""
+    a Rich renderable, or a widget (Markdown, for a command's table). Given draw(verbose)
+    instead, it's drawn again when ctrl+o folds or unfolds (a ! command's output)."""
 
-    def __init__(self, renderable, attached=True, glyph="", glyph_style=""):
+    def __init__(self, renderable=None, attached=True, glyph="", glyph_style="", draw=None, verbose=False):
+        self.draw = draw
+        if draw:
+            renderable = draw(verbose)
         self.renderable = renderable
         body = renderable if isinstance(renderable, Widget) else Static(renderable)
         super().__init__(glyph, glyph_style, body, classes="attached" if attached else "")
+
+    def set_verbose(self, verbose):
+        if self.draw:
+            self.renderable = self.draw(verbose)
+            self.body.update(self.renderable)
 
     def plain(self):
         return str(self.renderable) if isinstance(self.renderable, (str, Text)) else ""
@@ -402,13 +414,71 @@ class TaskPanel(Static):
             self.update(tools.block(rows))
 
 
-class QueuedPanel(Static):
-    DEFAULT_CSS = "QueuedPanel { height: auto; padding: 0 1; margin-top: 1; display: none; }"
+class QueuedPanel(Vertical):
+    """Prompts waiting behind the turn in progress, one row each. Clicking a row's ✕ takes it
+    back out of the queue; ctrl+q takes out the newest."""
 
-    def show(self, texts):
-        self.display = bool(texts)
-        self.update(Group(*(Text.assemble(("> ", theme.DIM), (" ".join(t.split())[:200], f"italic {theme.DIM}"),
-                                          ("  (queued)", f"italic {theme.LABEL}")) for t in texts)))
+    DEFAULT_CSS = f"""
+    QueuedPanel {{ height: auto; padding: 0 1; margin-top: 1; display: none; }}
+    QueuedPanel > Horizontal {{ height: 1; }}
+    QueuedPanel .queued-text {{ width: auto; max-width: 1fr; text-wrap: nowrap; text-overflow: ellipsis; }}
+    QueuedPanel .unqueue {{ width: auto; color: {theme.LABEL}; }}
+    QueuedPanel .unqueue:hover {{ color: {theme.ERROR}; }}
+    """
+
+    class Unqueue(Message):
+        def __init__(self, message_uuid):
+            super().__init__()
+            self.message_uuid = message_uuid
+
+    def show(self, items):
+        """items: (uuid, text) for each queued prompt, oldest first."""
+        self.display = bool(items)
+        rows = []
+        for n, (message_uuid, text) in enumerate(items):
+            hint = "  ✕ ctrl+q" if n == len(items) - 1 else "  ✕"
+            rows.append(Horizontal(
+                Static(Text.assemble(("> ", theme.DIM), (" ".join(text.split())[:200], f"italic {theme.DIM}"),
+                                     ("  (queued)", f"italic {theme.LABEL}")), classes="queued-text"),
+                UnqueueButton(hint, message_uuid)))
+        with self.app.batch_update():
+            self.remove_children()
+            if rows:
+                self.mount_all(rows)
+
+
+class UnqueueButton(Static):
+    def __init__(self, label, message_uuid):
+        super().__init__(Text(label), classes="unqueue")
+        self.message_uuid = message_uuid
+
+    def on_click(self, event):
+        event.stop()
+        self.post_message(QueuedPanel.Unqueue(self.message_uuid))
+
+
+class SideAnswer(Static):
+    """/btw: a side question and its answer, above the prompt and never in the conversation."""
+
+    DEFAULT_CSS = f"""
+    SideAnswer {{ height: auto; max-height: 50vh; overflow-y: auto; border: round {theme.LABEL};
+                  padding: 0 1; margin-top: 1; display: none; }}
+    """
+
+    def show(self, question, answer=None, error=False):
+        self.display = True
+        if answer is None:
+            body = Text("Answering…", style=f"italic {theme.DIM}")
+        elif error:
+            body = Text(answer, style=theme.ERROR)
+        else:
+            body = RichMarkdown(answer)
+        self.drawn = Group(Text.assemble(("/btw ", f"bold {theme.ACCENT}"), " ".join(question.split())),
+                           Text(""), body, Text(""), Text("Esc to dismiss", style=theme.DIM))
+        self.update(self.drawn)
+
+    def hide(self):
+        self.display = False
 
 
 # Prompt ---------------------------------------------------------------------------------------
@@ -421,8 +491,8 @@ class HRule(Static):
 
 
 class PromptInput(TextArea):
-    """The prompt. Enter sends (queued while Jarvis is busy), ctrl+x s sends now (interrupting;
-    on an empty prompt, sending what's queued);
+    """The prompt. Enter sends (queued while Jarvis is busy; ctrl+x s, handled by the app,
+    sends now);
     \\+Enter, ctrl+j or alt+enter start a new line; the arrows walk
     the suggestion menu when it's open and the prompt history at the first or last line."""
 
@@ -443,24 +513,10 @@ class PromptInput(TextArea):
     def __init__(self, **kw):
         super().__init__(soft_wrap=True, compact=True, highlight_cursor_line=False,
                          placeholder='Ask Jarvis anything, or try "/help"', **kw)
-        self.chord_until = 0.0  # ctrl+x was pressed; s before this sends now
 
     async def _on_key(self, event):
         app = self.app
         key = event.key
-        if key == "ctrl+x":  # instead of TextArea's cut: the start of ctrl+x s
-            event.stop()
-            event.prevent_default()
-            self.chord_until = time.monotonic() + 2
-            app.footer.flash("ctrl+x · s to send now", 2)
-            return
-        if self.chord_until:
-            pending, self.chord_until = time.monotonic() < self.chord_until, 0.0
-            if pending and key in ("s", "ctrl+s"):
-                event.stop()
-                event.prevent_default()
-                self.post_message(self.Submitted(self.text, now=True))
-                return
         if key == "enter":
             event.stop()
             event.prevent_default()
@@ -493,6 +549,11 @@ class PromptInput(TextArea):
         if not select and not self.text and self.app.show_all_sessions():
             return  # left arrow on an empty prompt: every saved conversation
         super().action_cursor_left(select)
+
+    def action_cursor_right(self, select=False):
+        if not select and not self.text and self.app.show_threads():
+            return  # right arrow on an empty prompt in /manager: the threads
+        super().action_cursor_right(select)
 
     def action_cursor_up(self, select=False):
         if not select and self.app.menu_move(-1):
@@ -644,6 +705,8 @@ SHORTCUTS = [
     ("esc esc to clear the prompt", "ctrl+t to show tasks"),
     ("ctrl+c twice to exit", "ctrl+g to edit in $EDITOR"),
     ("ctrl+x s to send now", "← for conversations"),
+    ("ctrl+q to unqueue the last prompt", "ctrl+[ / ctrl+] to jump between your messages"),
+    ("→ for the threads of /manager", ""),
 ]
 
 
@@ -669,6 +732,7 @@ class Dialog(Vertical):
     """
 
     can_focus = True
+    takes_focus = True  # on mounting; False for one in a /manager thread that isn't open
 
     DEFAULT_CSS = f"""
     Dialog {{ height: auto; max-height: 80vh; border: round {theme.PERMISSION}; padding: 0 1;
@@ -717,7 +781,8 @@ class Dialog(Vertical):
         if self.colour:
             self.styles.border = ("round", self.colour)
         self.redraw()
-        self.take_focus()
+        if self.takes_focus:
+            self.take_focus()
 
     def take_focus(self):
         self.focus()
@@ -920,6 +985,6 @@ class Transcript(VerticalScroll):
 
 
 __all__ = ["Banner", "Entry", "UserEntry", "AssistantEntry", "ThinkingEntry", "ToolEntry",
-           "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "PromptBar",
+           "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "UnqueueButton", "PromptBar",
            "PromptInput", "SuggestionMenu", "Footer", "Dialog", "Picker", "Transcript",
            "notice", "shortcuts", "elapsed"]

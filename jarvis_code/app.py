@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -25,17 +26,19 @@ from rich.text import Text
 from textual import events
 from textual.app import App
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import Markdown, Static
 
 from . import __version__, config_items, files, persona, sessions, stats, theme, tools
 from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment
+from .manager import MANAGER_PROMPT, SERVER, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
-                      Picker, PromptBar, QueuedPanel, Spinner, SuggestionMenu, TaskPanel,
-                      ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, shortcuts)
+                      Picker, PromptBar, PromptInput, QueuedPanel, SideAnswer, Spinner, SuggestionMenu,
+                      TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, shortcuts)
 
+CHORD_TIME = 2       # seconds after ctrl+x in which s sends now
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
 USAGE_REFRESH = 60   # seconds between asking for the plan's usage, so it keeps up with other windows
 
@@ -48,6 +51,13 @@ below. Reply with the title only.
 {}
 </message>"""
 TITLE_ARGS = ["--model", "haiku", "--tools", "", "--strict-mcp-config"]
+
+# /btw, as in Claude Code: a question about the conversation, answered in a fork of it that has
+# no tools and isn't saved, so it never joins the conversation or holds up the turn in progress.
+BTW_PROMPT = """The user has asked a side question with /btw while the main conversation carries \
+on. Answer it directly and briefly from what is already in the conversation. You have no tools \
+for this reply, and neither the question nor your answer will be kept in the conversation."""
+BTW_TIMEOUT = 180
 
 LOCAL_COMMANDS = {
     "help": "Show commands and shortcuts",
@@ -62,6 +72,8 @@ LOCAL_COMMANDS = {
     "copy": "Copy Jarvis's last reply to the clipboard",
     "export": "Save this conversation to a text file",
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
+    "btw": "Ask a quick side question without interrupting or adding to the conversation",
+    "manager": "Project manager mode: Jarvis hands the work to worker Jarvises (/manager off to stop)",
     "computer": "Show which computer this window is running on",
     "fuck": "Stop Jarvis right now, like esc",
     "exit": "Exit Jarvis",
@@ -74,11 +86,7 @@ ONLY_IN_CLAUDE = {"login", "logout", "plugin", "plugins", "permissions", "allowe
                   "memory", "theme", "terminal-setup", "ide", "vim", "statusline", "keybindings",
                   "privacy-settings", "bug", "feedback", "release-notes", "install-github-app",
                   "add-dir", "rewind", "checkpoint", "upgrade", "bashes", "tasks", "todos",
-                  "sandbox", "btw", "migrate-installer", "remote-control"}
-
-# Bookkeeping Claude Code doesn't show as tool calls: the task list (drawn under the spinner)
-# and loading deferred tools. ctrl+o shows them.
-QUIET_TOOLS = {"TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "ToolSearch"}
+                  "sandbox", "migrate-installer", "remote-control"}
 
 REJECTED = ("The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if "
             "it was a file edit, the new_string was NOT written to the file). STOP what you are "
@@ -140,6 +148,13 @@ def erase_is_delete():
 
 
 ERASE_IS_DELETE = erase_is_delete()
+
+
+def is_modifier(key):
+    """A modifier key pressed on its own. Terminals with the kitty keyboard protocol report
+    these, so letting go of ctrl between the x and the s of ctrl+x s sends one."""
+    return key.rsplit("_", 1)[-1] in ("shift", "control", "alt", "super", "meta", "hyper") \
+        or key in ("caps_lock", "num_lock")
 
 
 def is_word_backspace(event):
@@ -243,6 +258,8 @@ class JarvisApp(App):
 
     CSS = f"""
     Screen {{ background: ansi_default; layout: vertical; }}
+    #panes {{ height: 1fr; }}
+    #main {{ width: 1fr; height: 1fr; }}
     #dock {{ height: auto; padding: 0 1; }}
     SuggestionMenu, Footer {{ background: ansi_default; }}
     Markdown.reply, Markdown.plan {{ padding: 0; margin: 0; background: transparent; color: ansi_default; }}
@@ -292,7 +309,32 @@ class JarvisApp(App):
     async def on_event(self, event):
         if isinstance(event, events.Key) and is_word_backspace(event):
             event = events.Key("ctrl+w", None)  # delete a word, in the prompt and in every Input
+        if isinstance(event, events.Key) and not event.is_forwarded and self.window_key(event.key):
+            return
         await super().on_event(event)
+
+    def window_key(self, key):
+        """Keys taken before whatever has focus sees them (the transcript or a dialog may have
+        it): ctrl+x s, ctrl+q (Textual's quit otherwise), ctrl+[ and ctrl+]. True if taken."""
+        if self.chord_until and not is_modifier(key):
+            pending, self.chord_until = time.monotonic() < self.chord_until, 0.0
+            if pending and key in ("s", "ctrl+s"):
+                self.footer.flash_text = None
+                self.footer.redraw()
+                text = self.prompt.text if self.dialog is None else ""
+                self.prompt.post_message(PromptInput.Submitted(text, now=True))
+                return True
+        if key == "ctrl+x":  # instead of TextArea's cut: the start of ctrl+x s
+            self.chord_until = time.monotonic() + CHORD_TIME
+            self.footer.flash("ctrl+x · s to send now", CHORD_TIME)
+            return True
+        if key == "ctrl+q":
+            self.unqueue()
+            return True
+        if key in ("ctrl+left_square_bracket", "ctrl+right_square_bracket") and self.dialog is None:
+            self.jump_to_prompt(-1 if key == "ctrl+left_square_bracket" else 1)
+            return True
+        return False
 
     def __init__(self, options: Options):
         super().__init__(ansi_color=True)
@@ -323,8 +365,12 @@ class JarvisApp(App):
         self.blocks = {}     # (message id, block index) -> entry being streamed
         self.waiting = {}    # message id -> streamed entries waiting for their final text
         self.message_id = None
-        self.sent = []       # [text, shown] prompts not yet taken in by Claude Code
-        self.queued = []     # prompts typed while Jarvis was busy
+        self.sent = []       # [text, shown, uuid] prompts not yet taken in by Claude Code
+        self.updates = set() # uuids of /manager's thread updates not yet taken in
+        self.manager = None  # project manager mode's threads (manager.py), when it's on
+        self.capabilities = set()  # what Claude Code says it can do, on system/init
+        self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
+        self.jumped = None   # the message of yours ctrl+[ / ctrl+] last scrolled to
         self.pending_context = []  # ! output that goes along with the next prompt
         self.history = []
         self.history_index = -1
@@ -356,14 +402,18 @@ class JarvisApp(App):
     # Layout ---------------------------------------------------------------------------------
 
     def compose(self):
-        with Transcript(id="transcript"):
-            yield Banner()
-        yield Spinner(id="spinner")
-        yield TaskPanel(id="tasks")
-        yield QueuedPanel(id="queued")
-        with Vertical(id="dock"):
-            yield PromptBar(id="prompt-bar")
-        yield SuggestionMenu(id="menu")
+        with Horizontal(id="panes"):
+            with Vertical(id="main"):
+                with Transcript(id="transcript"):
+                    yield Banner()
+                yield Spinner(id="spinner")
+                yield TaskPanel(id="tasks")
+                yield QueuedPanel(id="queued")
+                with Vertical(id="dock"):
+                    yield SideAnswer(id="btw")
+                    yield PromptBar(id="prompt-bar")
+                yield SuggestionMenu(id="menu")
+            yield ManagerPane(id="manager")  # /manager's threads, on the right
         yield Footer(id="footer")
 
     async def on_mount(self):
@@ -374,6 +424,8 @@ class JarvisApp(App):
         self.spinner = self.query_one(Spinner)
         self.task_panel = self.query_one(TaskPanel)
         self.queued_panel = self.query_one(QueuedPanel)
+        self.side_answer = self.query_one(SideAnswer)
+        self.manager_pane = self.query_one(ManagerPane)
         self.dock = self.query_one("#dock")
         self.prompt_bar = self.query_one(PromptBar)
         self.prompt = self.prompt_bar.input
@@ -421,15 +473,21 @@ class JarvisApp(App):
     # The engine -----------------------------------------------------------------------------
 
     async def start_engine(self, resume=None):
+        system_prompt = persona.PERSONA if self.options.persona else None
+        if self.manager is not None:  # the coordinator, with the tools to run its threads
+            system_prompt = (system_prompt + "\n\n" if system_prompt else "") + MANAGER_PROMPT
         engine = Engine(self.cwd, None, None, model=self.model_override, effort=self.effort_override,
                         permission_mode=self.mode if self.mode != "default" else None,
-                        resume=resume, append_system_prompt=persona.PERSONA if self.options.persona else None,
+                        resume=resume, append_system_prompt=system_prompt,
                         thinking_display=self.options.thinking_display,
+                        sdk_mcp_servers=[SERVER] if self.manager is not None else (),
+                        on_mcp=self.manager.handle_mcp if self.manager is not None else None,
                         command=self.options.engine_command, log_path=self.options.log_path)
         engine.on_message = lambda msg: self.on_engine_message(engine, msg)
         engine.on_permission = lambda rid, req: self.permission_queue.put_nowait((engine, rid, req))
         self.engine = engine
         self.session_id = resume
+        self.updates.clear()
         self.engine_state = "connecting"
         self.update_footer()
         try:
@@ -653,7 +711,7 @@ class JarvisApp(App):
 
     def tool_entry(self, tool_id, name, tool_input):
         entry = ToolEntry(tool_id, name, tool_input, self.cwd, self.verbose)
-        if name in QUIET_TOOLS:
+        if name in tools.QUIET_TOOLS:
             entry.add_class("quiet")
             entry.display = self.verbose
         self.tools[tool_id] = entry
@@ -742,26 +800,42 @@ class JarvisApp(App):
             await self.show_saved_prompt(user_text(content))
             return
         if msg.get("isReplay"):
-            await self.on_replay(user_text(content))
+            await self.on_replay(user_text(content), msg.get("uuid"))
 
-    async def on_replay(self, text):
+    async def on_replay(self, text, message_uuid=None):
         """Claude Code took in a prompt: show it if it was waiting in the queue."""
+        if message_uuid in self.updates:  # a /manager thread's news, for the coordinator
+            self.updates.discard(message_uuid)
+            await self.add(NoticeEntry(update_notice(text) or notice("A thread update"), attached=False))
+            if not self.busy:
+                self.begin_turn()
+            return
         if text.lstrip().startswith(("<command-", "/")) or not self.sent:
             return
-        item = self.sent.pop(0)
-        prompt, shown = item
-        if prompt in self.queued:
-            self.queued.remove(prompt)
-            self.queued_panel.show(self.queued)
+        item = next((item for item in self.sent if message_uuid and item[2] == message_uuid), self.sent[0])
+        self.sent = [other for other in self.sent if other is not item]
+        prompt, shown, _ = item
         if not shown:
+            self.show_queued()
             await self.add(UserEntry(prompt))
         if not self.busy:
             self.begin_turn()
+
+    @property
+    def queued(self):
+        """Prompts typed while Jarvis was busy, still waiting in Claude Code's queue."""
+        return [text for text, shown, _ in self.sent if not shown]
+
+    def show_queued(self):
+        self.queued_panel.show([(message_uuid, text) for text, shown, message_uuid in self.sent if not shown])
 
     async def show_saved_prompt(self, text):
         """A user record from a saved conversation: a prompt, a command, or ! output."""
         text = text.strip()
         if not text or text.startswith(("<system-reminder>", "<local-command-caveat>", "Caveat:")):
+            return
+        if update_notice(text) is not None:
+            await self.add(NoticeEntry(update_notice(text), attached=False))
             return
         if text.startswith("[Request interrupted"):
             await self.add(NoticeEntry(tools.interrupted()))
@@ -782,7 +856,8 @@ class JarvisApp(App):
             return
         if text.startswith("<bash-stdout>"):
             out = (tag(text, "bash-stdout") or "") + (tag(text, "bash-stderr") or "")
-            await self.add(NoticeEntry(tools.block(tools.plain_lines(out, self.verbose) or [Text("(No output)", style=theme.DIM)])))
+            await self.add(NoticeEntry(draw=lambda verbose: tools.block(
+                tools.plain_lines(out, verbose) or [Text("(No output)", style=theme.DIM)]), verbose=self.verbose))
             return
         await self.add(UserEntry(text))
 
@@ -801,6 +876,7 @@ class JarvisApp(App):
             self.set_model(msg.get("model"))
             self.set_mode(msg.get("permissionMode"))
             self.mcp_servers = msg.get("mcp_servers") or self.mcp_servers
+            self.capabilities = set(msg.get("capabilities") or [])
             if not self.busy and self.sent:
                 self.begin_turn()
         elif sub == "status":
@@ -861,13 +937,11 @@ class JarvisApp(App):
         # Prompts shown already were taken in; ones still queued come next, as a new turn.
         # Claude Code keeps them through an interrupt too (that's how ctrl+x s sends them now).
         self.sent = [item for item in self.sent if not item[1]]
-        if self.sent:
+        if self.sent or self.updates:
             self.interrupting = False
             self.turn_started = time.monotonic()
         else:
-            self.sent.clear()
-            self.queued.clear()
-            self.queued_panel.show([])
+            self.show_queued()
             self.end_turn()
         self.run_worker(self.refresh_context(), group="context")
         self.refresh_usage()
@@ -966,6 +1040,7 @@ class JarvisApp(App):
         if not self.transcript.is_anchored and self.transcript.max_scroll_y > 0:
             self.transcript.anchor()
         self.spinner.tick()
+        self.manager_pane.tick()
         on = int(time.monotonic() * 2.5) % 2 == 0
         for entry in self.tools.values():
             if entry.state == "running":
@@ -1036,13 +1111,19 @@ class JarvisApp(App):
             except EngineError:
                 pass
 
-    async def decide(self, request_id, request):
-        name = request.get("tool_name")
+    async def decide(self, request_id, request, view=None):
+        """Answer a can_use_tool request with a dialog. view is where it's shown and what it
+        changes: the window, or a /manager thread (manager.Thread), each with show_dialog,
+        tools and set_mode."""
+        view = view or self
+        name = request.get("tool_name") or ""
+        if name.startswith(f"mcp__{SERVER}__"):  # the window's own tools for /manager
+            return {"behavior": "allow", "updatedInput": request.get("input") or {}}
         if name == "AskUserQuestion":
-            return await self.ask_questions(request_id, request.get("input") or {})
+            return await self.ask_questions(request_id, request.get("input") or {}, view)
         if name == "ExitPlanMode":
-            return await self.approve_plan(request_id, request.get("input") or {})
-        return await self.ask_permission(request_id, request)
+            return await self.approve_plan(request_id, request.get("input") or {}, view)
+        return await self.ask_permission(request_id, request, view)
 
     async def show_dialog(self, dialog, request_id=None):
         self.menu.hide()
@@ -1093,7 +1174,7 @@ class JarvisApp(App):
             return f"Yes, and always allow access to {dirs} {where}"
         return "Yes, and don't ask again"
 
-    async def ask_permission(self, request_id, request):
+    async def ask_permission(self, request_id, request, view):
         name = request.get("tool_name") or "?"
         tool_input = request.get("input") or {}
         path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
@@ -1142,11 +1223,11 @@ class JarvisApp(App):
         choices.append("No, and tell Jarvis what to do differently (esc)")
         dialog = Dialog(title, Static(Group(*rows)), question, choices)
         self.notify_hooks("permission_prompt", f"Claude needs your permission to use {name}")
-        entry = self.tools.get(request.get("tool_use_id"))
+        entry = view.tools.get(request.get("tool_use_id"))
         if entry is not None:
             entry.set_waiting(True)
         try:
-            picked = await self.show_dialog(dialog, request_id)
+            picked = await view.show_dialog(dialog, request_id)
         finally:
             if entry is not None:
                 entry.set_waiting(False)
@@ -1159,7 +1240,7 @@ class JarvisApp(App):
             suggestion = suggestions[picked - 1]
             response["updatedPermissions"] = [suggestion]
             if suggestion.get("type") == "setMode":
-                self.set_mode(suggestion.get("mode"))
+                view.set_mode(suggestion.get("mode"))
         return response
 
     def notify_hooks(self, kind, message):
@@ -1196,7 +1277,7 @@ class JarvisApp(App):
         except (OSError, asyncio.TimeoutError):
             pass
 
-    async def ask_questions(self, request_id, tool_input):
+    async def ask_questions(self, request_id, tool_input, view):
         answers = {}
         questions = tool_input.get("questions") or []
         for n, q in enumerate(questions, 1):
@@ -1210,7 +1291,7 @@ class JarvisApp(App):
             dialog = Dialog(f"☐ {header}{count}", None, q.get("question", ""), choices,
                             text_choice=len(options), multi=multi,
                             hint="Enter to choose" + (" · Space to tick" if multi else "") + " · Esc to cancel")
-            picked = await self.show_dialog(dialog, request_id)
+            picked = await view.show_dialog(dialog, request_id)
             if picked is None:
                 return {"behavior": "deny", "message": "The user declined to answer the questions.",
                         "interrupt": True}
@@ -1223,26 +1304,26 @@ class JarvisApp(App):
                 answers[q.get("question", "")] = options[picked][0]
         return {"behavior": "allow", "updatedInput": {**tool_input, "answers": answers}}
 
-    async def approve_plan(self, request_id, tool_input):
+    async def approve_plan(self, request_id, tool_input, view):
         plan = tool_input.get("plan") or ""
         if not plan and tool_input.get("planFilePath"):
             try:
                 plan = open(tool_input["planFilePath"], errors="replace").read()
             except OSError:
                 pass
-        view = VerticalScroll(Markdown(plan or "(no plan text)", classes="plan"), id="plan-view")
+        plan_view = VerticalScroll(Markdown(plan or "(no plan text)", classes="plan"), id="plan-view")
         choices = ["Yes, and use auto mode", "Yes, and auto-accept edits",
                    "Yes, and manually approve edits", "No, keep planning (tell Jarvis what to change)"]
-        dialog = Dialog("Ready to code? Here is Jarvis's plan:", view, "Would you like to proceed?",
+        dialog = Dialog("Ready to code? Here is Jarvis's plan:", plan_view, "Would you like to proceed?",
                         choices, text_choice=3)
-        picked = await self.show_dialog(dialog, request_id)
+        picked = await view.show_dialog(dialog, request_id)
         if picked is None:
             return {"behavior": "deny", "message": "The user rejected the plan and wants to give "
                     "other instructions. Wait for them.", "interrupt": True}
         if isinstance(picked, tuple):
             return {"behavior": "deny", "message": f"The user wants to keep planning. Their feedback: {picked[1]}"}
         mode = ["auto", "acceptEdits", "default"][picked]
-        self.set_mode(mode)
+        view.set_mode(mode)
         return {"behavior": "allow", "updatedInput": tool_input,
                 "updatedPermissions": [{"type": "setMode", "mode": mode, "destination": "session"}]}
 
@@ -1263,6 +1344,9 @@ class JarvisApp(App):
                 self.footer.flash("Nothing to stop")
             return
         self.history_index = -1
+        if self.jumped is not None:
+            self.unjump()
+            self.transcript.scroll_end(animate=False)
         if text in self.history:
             self.history.remove(text)
         self.history.insert(0, text)
@@ -1270,12 +1354,55 @@ class JarvisApp(App):
         self.submissions.put_nowait((text, event.now))
 
     def send_queued_now(self):
-        """ctrl+x s on an empty prompt: stop the turn in progress, and the prompts queued behind
-        it, which Claude Code keeps, run straight away."""
+        """ctrl+x s on an empty prompt: the prompts queued behind the turn in progress run
+        straight away (Claude Code stops that turn for them, or moves what it waits on to the
+        background)."""
         if not self.queued:
             self.footer.flash("Nothing queued")
             return
-        self.run_worker(self.interrupt(), group="interrupt")
+        self.run_worker(self.send_waiting_now(), group="interrupt")
+
+    async def send_waiting_now(self):
+        if not self.busy or not self.engine:
+            return
+        if "interrupt_send_now_v1" not in self.capabilities:
+            await self.interrupt()  # an older Claude Code: it keeps the queue through an interrupt
+            return
+        self.interrupting = True  # if the turn is stopped, its result reads as an interruption
+        try:
+            done = await self.engine.send_now()
+        except EngineError as e:
+            done = None
+            self.footer.flash(str(e), 3)
+        if done != "stopped" and self.busy:
+            self.interrupting = False
+
+    def unqueue(self, message_uuid=None):
+        """ctrl+q, or a queued prompt's ✕: take it back out of Claude Code's queue (ctrl+q: the
+        newest). It stays in the prompt history."""
+        waiting = [item for item in self.sent if not item[1]]
+        if not waiting:
+            self.footer.flash("Nothing queued")
+            return
+        item = next((item for item in waiting if item[2] == message_uuid), None) if message_uuid else waiting[-1]
+        if item is not None and self.engine is not None:
+            self.run_worker(self.cancel_queued(item), group="unqueue")
+
+    async def cancel_queued(self, item):
+        try:
+            cancelled = await self.engine.cancel_queued(item[2])
+        except EngineError as e:
+            self.footer.flash(f"Couldn't unqueue it: {e}", 3)
+            return
+        if not cancelled:
+            self.footer.flash("Too late to unqueue: Jarvis has taken it in", 3)
+            return
+        self.sent = [other for other in self.sent if other is not item]
+        self.show_queued()
+        self.footer.flash("Unqueued · ↑ brings it back", 3)
+
+    def on_queued_panel_unqueue(self, event):
+        self.unqueue(event.message_uuid)
 
     async def submission_loop(self):
         """Prompts run here, one at a time and in order, never in a key handler: a command
@@ -1319,16 +1446,16 @@ class JarvisApp(App):
         if self.pending_context:
             content = "\n".join(self.pending_context) + "\n\n" + text
             self.pending_context = []
+        message_uuid = str(uuid.uuid4())
         if self.busy:
-            self.queued.append(text)
-            self.queued_panel.show(self.queued)
-            self.sent.append([text, False])
+            self.sent.append([text, False, message_uuid])
+            self.show_queued()
         else:
             await self.add(UserEntry(text))
-            self.sent.append([text, True])
+            self.sent.append([text, True, message_uuid])
             self.begin_turn()
         try:
-            await self.engine.send(content)
+            await self.engine.send(content, message_uuid)
         except EngineError as e:
             await self.note(str(e), theme.ERROR)
 
@@ -1458,6 +1585,10 @@ class JarvisApp(App):
             await self.cmd_export(args)
         elif name == "claude":
             await self.cmd_claude()
+        elif name == "btw":
+            self.cmd_btw(args)
+        elif name == "manager":
+            await self.cmd_manager(args)
         elif name == "computer":
             await self.note(f"Running on {platform.node()} ({platform.system()} {platform.release()})")
         elif name in ONLY_IN_CLAUDE and name not in self.commands:
@@ -1484,6 +1615,90 @@ class JarvisApp(App):
         try:
             await self.engine.send(text)
         except EngineError as e:
+            await self.note(str(e), theme.ERROR)
+
+    def cmd_btw(self, question):
+        if not question:
+            self.footer.flash("Usage: /btw <your question>", 3)
+            return
+        self.side_answer.show(question)
+        self.run_worker(self.side_question(question), group="btw", exclusive=True)
+
+    async def side_question(self, question):
+        extra = ["--tools", "", "--strict-mcp-config",
+                 "--append-system-prompt", (persona.PERSONA + "\n\n" if self.options.persona else "") + BTW_PROMPT]
+        if self.session_id:
+            extra += ["--resume", self.session_id, "--fork-session"]
+        if self.model:
+            extra += ["--model", self.model]
+        if self.effort:
+            extra += ["--effort", self.effort]
+        try:
+            answer = await self.claude_print(question, timeout=BTW_TIMEOUT, extra=extra)
+        except EngineError as e:
+            self.side_answer.show(question, f"Couldn't answer: {e}", error=True)
+            return
+        self.side_answer.show(question, answer or "(No answer)")
+
+    def dismiss_side_answer(self):
+        self.workers.cancel_group(self, "btw")
+        self.side_answer.hide()
+
+    async def cmd_manager(self, args):
+        """/manager [what to do]: this conversation becomes the coordinator, with tools to hand
+        tasks to worker Jarvises shown on the right. /manager off stops them all."""
+        if len(args) >= 2 and args[0] == args[-1] and args[0] in "\"'":
+            args = args[1:-1].strip()
+        if args.lower() == "off":
+            await self.leave_manager()
+            return
+        if self.manager is None:
+            if self.busy:
+                await self.note("Jarvis is in the middle of something; try /manager once it's done.")
+                return
+            self.manager = Manager(self, self.manager_pane)
+            self.manager_pane.display = True
+            await self.stop_engine()  # again with the coordinator's prompt and tools
+            await self.note("Project manager mode: Jarvis coordinates here and hands the work to threads on "
+                            "the right. → on an empty prompt goes to them; /manager off stops them.")
+            if not await self.start_engine(resume=self.session_id):
+                return
+        elif not args:
+            self.show_threads()
+            return
+        if args:
+            await self.send_prompt(args)
+
+    async def leave_manager(self):
+        if self.manager is None:
+            self.footer.flash("Project manager mode isn't on")
+            return
+        await self.stop_turn()
+        manager, self.manager = self.manager, None
+        await manager.close()
+        self.manager_pane.display = False
+        await self.stop_engine()
+        await self.start_engine(resume=self.session_id)
+        await self.note("Project manager mode is off; its threads are stopped.")
+
+    def show_threads(self):
+        """Right arrow on an empty prompt in manager mode: the threads."""
+        if self.manager is None or self.dialog is not None or self.menu.display:
+            return False
+        self.manager_pane.focus_list()
+        return True
+
+    async def send_update(self, text):
+        """News from a /manager thread for the coordinator: shown as a line in the transcript
+        when Claude Code takes it in, not as a message of yours."""
+        if self.manager is None or self.engine is None or not self.engine.running:
+            return
+        message_uuid = str(uuid.uuid4())
+        self.updates.add(message_uuid)
+        try:
+            await self.engine.send(text, message_uuid)
+        except EngineError as e:
+            self.updates.discard(message_uuid)
             await self.note(str(e), theme.ERROR)
 
     async def show_help(self):
@@ -1686,6 +1901,9 @@ class JarvisApp(App):
         except asyncio.TimeoutError:
             proc.kill()
             raise EngineError("Claude Code took too long") from None
+        except asyncio.CancelledError:  # a /btw dismissed before its answer came
+            proc.kill()
+            raise
         text = out.decode(errors="replace").strip()
         if proc.returncode and not text:
             raise EngineError(err.decode(errors="replace").strip()[-300:] or f"exit code {proc.returncode}")
@@ -1874,7 +2092,8 @@ class JarvisApp(App):
             out, err = b"", b"Timed out after 10 minutes"
         out, err = out.decode(errors="replace"), err.decode(errors="replace")
         data = {"stdout": out, "stderr": err}
-        await self.add(NoticeEntry(tools.result("Bash", {"command": command}, out, data, False, self.cwd, self.verbose)))
+        await self.add(NoticeEntry(draw=lambda verbose: tools.result("Bash", {"command": command}, out, data, False,
+                                                                     self.cwd, verbose), verbose=self.verbose))
         self.pending_context.append(f"<bash-input>{command}</bash-input>\n<bash-stdout>{out[-30000:]}</bash-stdout>"
                                     f"<bash-stderr>{err[-5000:]}</bash-stderr>")
 
@@ -1889,6 +2108,9 @@ class JarvisApp(App):
             return
         if self.dialog is not None:
             self.dialog.finish(None)
+            return
+        if self.manager_pane.has_focus_within:
+            self.manager_pane.ctrl_c()
             return
         if self.prompt.text:
             self.prompt.clear()
@@ -1916,6 +2138,9 @@ class JarvisApp(App):
         if self.menu.display:
             self.menu.hide()
             return
+        if self.side_answer.display:
+            self.dismiss_side_answer()
+            return
         if self.busy:
             self.run_worker(self.interrupt(), group="interrupt")
             return
@@ -1932,7 +2157,7 @@ class JarvisApp(App):
             self.dialog.press("shift+tab", None)
             self.dialog.redraw()
             return
-        if self.dialog is not None:
+        if self.dialog is not None or self.manager_pane.has_focus_within:
             return
         modes = theme.MODES
         mode = modes[(modes.index(self.mode) + 1) % len(modes)] if self.mode in modes else "default"
@@ -1948,9 +2173,10 @@ class JarvisApp(App):
 
     def action_toggle_verbose(self):
         self.verbose = not self.verbose
+        transcripts = [self.transcript] + [t.view.transcript for t in (self.manager.threads if self.manager else [])]
         with self.batch_update():
-            for entry in self.transcript.children:
-                if isinstance(entry, (ToolEntry, ThinkingEntry)):
+            for entry in (e for transcript in transcripts for e in transcript.children):
+                if isinstance(entry, (ToolEntry, ThinkingEntry, NoticeEntry)):
                     entry.set_verbose(self.verbose)
                 if entry.has_class("quiet"):
                     entry.display = self.verbose
@@ -1967,17 +2193,48 @@ class JarvisApp(App):
         self.refresh_tasks()
 
     def action_scroll_bottom(self):
+        self.unjump()
         self.transcript.scroll_end(animate=False)
+
+    def jump_to_prompt(self, step):
+        """ctrl+[ (step -1) and ctrl+] (step 1): scroll to the previous or next of your messages.
+        ctrl+[ starts from the last one and ctrl+] from the first; going past the last is back
+        to the end of the conversation."""
+        prompts = [e for e in self.transcript.children if isinstance(e, UserEntry) and e.display]
+        if not prompts:
+            self.footer.flash("No messages of yours yet")
+            return
+        if self.jumped in prompts:
+            index = prompts.index(self.jumped) + step
+        else:
+            index = len(prompts) - 1 if step < 0 else 0
+        self.unjump()
+        if index >= len(prompts):
+            self.transcript.scroll_end(animate=False)
+            return
+        if index < 0:
+            index = 0
+            self.footer.flash("That's your first message")
+        self.jumped = prompts[index]
+        self.jumped.add_class("picked")
+        self.transcript.scroll_to_widget(self.jumped, top=True, animate=False)
+
+    def unjump(self):
+        if self.jumped is not None:
+            self.jumped.remove_class("picked")
+            self.jumped = None
 
     def action_page(self, direction):
         if isinstance(self.dialog, Picker):
             self.dialog.dialog_key("pageup" if direction < 0 else "pagedown")
             self.dialog.redraw()
             return
+        opened = self.manager_pane.opened
+        transcript = opened.view.transcript if opened and self.manager_pane.has_focus_within else self.transcript
         if direction < 0:
-            self.transcript.scroll_page_up()
+            transcript.scroll_page_up()
         else:
-            self.transcript.scroll_page_down()
+            transcript.scroll_page_down()
 
     def action_external_editor(self):
         editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or shutil.which("nano")
@@ -1995,11 +2252,15 @@ class JarvisApp(App):
         self.prompt.focus()
 
     async def quit(self):
+        if self.manager is not None:
+            await self.manager.close()
         await self.stop_engine()
         self.exit(self.session_id)
 
     async def on_unmount(self):
-        if self.engine is not None:  # the window closed some other way
+        if self.manager is not None:  # the window closed some other way
+            await asyncio.gather(*(t.close() for t in self.manager.threads), return_exceptions=True)
+        if self.engine is not None:
             engine, self.engine = self.engine, None
             await engine.stop()
 
@@ -2032,8 +2293,9 @@ class JarvisApp(App):
         self.waiting.clear()
         self.todos, self.tasks = [], {}
         self.sent.clear()
-        self.queued.clear()
-        self.queued_panel.show([])
+        self.updates.clear()
+        self.show_queued()
+        self.jumped = None
         self.context_pct = None
         self.transcript.anchor(False)
         self.transcript.scroll_home(animate=False)

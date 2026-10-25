@@ -26,10 +26,12 @@ LABEL = "#6e96be"         # labels, hints and the prompt's rules
 DIM = "#8592a6"           # dim text
 CODE = "#8ccfff"          # inline code
 USER_BG = "#16202e"       # behind your own messages
+PICKED_BG = "#223552"     # behind the message ctrl+[ / ctrl+] jumped to
 PERMISSION = "#5aa9ff"    # permission and question dialogs
 SUCCESS = "#4eba65"
 ERROR = "#ff6b80"
 WARNING = "#e8b75a"       # usage-limit warnings only
+ATTENTION = "#ff9e3d"     # a /manager thread waiting for you
 
 DIFF_ADDED = "#1d3a28"
 DIFF_REMOVED = "#45202a"
@@ -46,6 +48,17 @@ MODE_LOOK = {
     "dontAsk": ("⏵⏵", "don't ask on", ERROR),
 }
 BASH_MODE = "#4fd1e8"  # the prompt after a leading !
+
+# /manager's threads, by what they're doing.
+THREAD_LOOK = {
+    # status: (glyph, colour, word)
+    "starting": ("○", DIM, "starting"),
+    "working": ("●", ACCENT, "working"),
+    "attention": ("◆", ATTENTION, "needs you"),
+    "done": ("✔", SUCCESS, "finished"),
+    "error": ("✘", ERROR, "failed"),
+    "stopped": ("■", LABEL, "stopped"),
+}
 
 BULLET = "●"
 RESULT = "⎿"

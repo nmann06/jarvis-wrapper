@@ -1,6 +1,7 @@
 """A stand-in for `claude -p` in stream-json mode, for testing the window without spending
 anything: it answers the control requests Jarvis sends and plays a scripted turn for each
-prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow).
+prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow, very slow,
+delegate: /manager's coordinator starting two threads through the window's MCP server).
 
 Every line it receives is appended to $FAKE_CLAUDE_LOG, so tests can check what was sent.
 """
@@ -41,18 +42,39 @@ def control_response(request_id, response):
                                                    "response": response}})
 
 
-def ask(tool_name, tool_input, tool_use_id, suggestions=None, interaction=False):
+def control(request):
+    """A control request of ours to the window; returns its response."""
     request_id = str(uuid.uuid4())
-    request = {"subtype": "can_use_tool", "tool_name": tool_name, "display_name": tool_name,
-               "input": tool_input, "tool_use_id": tool_use_id,
-               "permission_suggestions": suggestions or []}
-    if interaction:
-        request["requires_user_interaction"] = True
     emit({"type": "control_request", "request_id": request_id, "request": request})
     with answered:
         while request_id not in answers:
             answered.wait(0.1)
         return answers.pop(request_id)
+
+
+def ask(tool_name, tool_input, tool_use_id, suggestions=None, interaction=False):
+    request = {"subtype": "can_use_tool", "tool_name": tool_name, "display_name": tool_name,
+               "input": tool_input, "tool_use_id": tool_use_id,
+               "permission_suggestions": suggestions or []}
+    if interaction:
+        request["requires_user_interaction"] = True
+    return control(request)
+
+
+def mcp(server, method, params=None, message_id=None):
+    """A JSON-RPC message to one of the window's own MCP servers; returns its reply."""
+    message = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+    if message_id is not None:
+        message["id"] = message_id
+    return control({"subtype": "mcp_message", "server_name": server, "message": message}).get("mcp_response")
+
+
+def connect_sdk_servers(servers):
+    """What Claude Code does with initialize's sdkMcpServers: the MCP handshake, then tools/list."""
+    for server in servers:
+        mcp(server, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {}}, 0)
+        mcp(server, "notifications/initialized")
+        state.setdefault("sdk_tools", {})[server] = mcp(server, "tools/list", {}, 1)["result"]["tools"]
 
 
 def stream_text(message_id, index, text, delay=0.0):
@@ -105,16 +127,25 @@ def result(text="", is_error=False, subtype="success"):
           "num_turns": 1, "duration_ms": 10, "total_cost_usd": 0.0})
 
 
-def turn(prompt):
+def turn(prompt, message_uuid=None):
     interrupted.clear()
+    if state.get("connecting"):  # the first turn waits for the window's MCP servers, as Claude Code's does
+        state["connecting"].join(5)
     emit({"type": "system", "subtype": "init", "session_id": state["session"], "model": "claude-haiku-5-5",
-          "permissionMode": mode["value"], "tools": ["Bash", "Edit", "Read"], "mcp_servers": []})
-    emit({"type": "user", "isReplay": True, "parent_tool_use_id": None,
+          "permissionMode": mode["value"], "tools": ["Bash", "Edit", "Read"], "mcp_servers": [],
+          "capabilities": ["interrupt_send_now_v1"]})
+    emit({"type": "user", "isReplay": True, "parent_tool_use_id": None, "uuid": message_uuid,
           "message": {"role": "user", "content": prompt}})
     emit({"type": "system", "subtype": "status", "status": "requesting"})
     mid = "msg_" + uuid.uuid4().hex[:8]
     message_start(mid)
     p = prompt.lower().rsplit("\n", 1)[-1]  # the words typed, after any ! output sent along
+
+    if prompt.startswith("<thread-update"):  # the window telling the coordinator how a thread went
+        stream_text(mid, 0, "Noted.")
+        message_stop()
+        result("ok")
+        return
 
     if p.startswith("/model"):
         emit({"type": "assistant", "parent_tool_use_id": None, "local_command_source": "x",
@@ -212,9 +243,20 @@ def turn(prompt):
         tool_result("toolu_bash", out, {"stdout": out, "stderr": ""})
         stream_text(mid, 1, "Twelve files.")
     elif "slow" in p:
-        if not stream_text(mid, 0, " ".join(["word"] * 60), delay=0.03):
+        delay = 0.3 if "very slow" in p else 0.03  # very slow: about 18 seconds, for an interrupt to end
+        if not stream_text(mid, 0, " ".join(["word"] * 60), delay=delay):
             result("", subtype="error_during_execution", is_error=True)
             return
+    elif "delegate" in p and "manager" in state.get("sdk_tools", {}):
+        for n, (title, task) in enumerate((("Say hello", "hello"), ("Edit the notes", "edit the notes"))):
+            tool_id, args = f"toolu_start{n}", {"title": title, "prompt": task}
+            tool_use(mid, tool_id, "mcp__manager__start_thread", args, index=n)
+            if ask("mcp__manager__start_thread", args, tool_id).get("behavior") != "allow":
+                tool_result(tool_id, "rejected", is_error=True)
+                continue
+            reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 10 + n)
+            tool_result(tool_id, reply["result"]["content"])
+        stream_text(mid, 2, "Two threads are on it.")
     elif "tasks" in p:
         tool_use(mid, "toolu_tc", "TaskCreate", {"subject": "Write the tests", "activeForm": "Writing the tests"})
         tool_result("toolu_tc", "Task #1 created", {"task": {"id": "1", "subject": "Write the tests"}})
@@ -313,8 +355,14 @@ USAGE = {
 
 
 def work(prompts):
-    while (prompt := prompts.get()) is not None:
-        turn(prompt)
+    while (item := prompts.get()) is not None:
+        turn(*item)
+
+
+def waiting(prompts):
+    """The uuids of the prompts queued behind the turn in progress."""
+    with prompts.mutex:
+        return [u for _, u in prompts.queue if u]
 
 
 def main():
@@ -337,6 +385,10 @@ def main():
             sub = request.get("subtype")
             rid = msg.get("request_id")
             if sub == "initialize":
+                if request.get("sdkMcpServers"):
+                    state["connecting"] = threading.Thread(target=connect_sdk_servers, daemon=True,
+                                                           args=(request["sdkMcpServers"],))
+                    state["connecting"].start()
                 control_response(rid, {
                     "commands": [{"name": "compact", "description": "Free up context", "argumentHint": ""},
                                  {"name": "model", "description": "Set the AI model", "argumentHint": "<model>"},
@@ -380,9 +432,20 @@ def main():
             elif sub == "set_permission_mode":
                 mode["value"] = request.get("mode")
                 control_response(rid, {"mode": mode["value"]})
+            elif sub == "interrupt" and request.get("send_now"):
+                still = waiting(prompts)
+                if still:
+                    interrupted.set()
+                control_response(rid, {"still_queued": still, "send_now": "stopped" if still else "nothing_waiting"})
             elif sub == "interrupt":
                 interrupted.set()
-                control_response(rid, {"still_queued": []})
+                control_response(rid, {"still_queued": waiting(prompts)})
+            elif sub == "cancel_async_message":
+                with prompts.mutex:
+                    found = [item for item in prompts.queue if item[1] == request.get("message_uuid")]
+                    for item in found:
+                        prompts.queue.remove(item)
+                control_response(rid, {"cancelled": bool(found)})
             elif sub == "mcp_status":
                 late = float(os.environ.get("FAKE_MCP_LATE", "0"))  # seconds until they connect
                 connected = time.monotonic() - STARTED >= late
@@ -398,7 +461,7 @@ def main():
             content = msg["message"]["content"]
             text = content if isinstance(content, str) else " ".join(
                 b.get("text", "") for b in content if b.get("type") == "text")
-            prompts.put(text)
+            prompts.put((text, msg.get("uuid")))
     prompts.put(None)
     worker.join(timeout=5)
 

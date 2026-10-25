@@ -11,9 +11,11 @@ import time
 import pytest
 from rich.console import Console
 
-from jarvis_code import sessions
+from textual.widget import Widget
+
+from jarvis_code import sessions, theme
 from jarvis_code.app import JarvisApp, Options
-from jarvis_code.widgets import AssistantEntry, NoticeEntry, ThinkingEntry, ToolEntry, UserEntry
+from jarvis_code.widgets import AssistantEntry, NoticeEntry, ThinkingEntry, ToolEntry, UnqueueButton, UserEntry
 
 FAKE = [sys.executable, os.path.join(os.path.dirname(__file__), "fake_claude.py")]
 SIZE = (110, 40)
@@ -288,6 +290,48 @@ async def test_shell_output_goes_with_next_prompt(home):
         await until(pilot, lambda: not app.busy and replies(app))
         prompt = [m for m in sent(home) if m.get("type") == "user"][0]["message"]["content"]
         assert prompt.startswith("<bash-input>echo from-the-shell</bash-input>") and prompt.endswith("hello")
+
+
+async def test_shell_output_unfolds_with_ctrl_o(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "!seq 1 12")
+        await until(pilot, lambda: any("+8 lines" in text_of(n.renderable) for n in entries(app, NoticeEntry)))
+        await pilot.press("ctrl+o")
+        out = text_of(entries(app, NoticeEntry)[-1].renderable)
+        assert "12" in out and "ctrl+o to expand" not in out
+        await pilot.press("ctrl+o")
+        assert "+8 lines" in text_of(entries(app, NoticeEntry)[-1].renderable)
+
+
+async def test_btw_answers_aside(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "hello")
+        await until(pilot, lambda: replies(app) and not app.busy)
+        before = len(app.transcript.children)
+        await send(pilot, "/btw what did I say?")
+        await until(pilot, lambda: "ran what did I say?" in text_of(app.side_answer.drawn))
+        assert len(app.transcript.children) == before  # not part of the conversation
+        argv = [m["argv"] for m in sent(home) if "argv" in m][-1]
+        assert argv[:2] == ["-p", "what did I say?"] and "--no-session-persistence" in argv
+        assert argv[argv.index("--tools") + 1] == "" and "--fork-session" in argv
+        assert argv[argv.index("--resume") + 1] == app.session_id
+        await pilot.press("escape")
+        assert not app.side_answer.display and not app.busy
+
+
+async def test_btw_without_a_question(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/btw")
+        await pilot.pause(0.2)
+        printed = [m["argv"] for m in sent(home) if "argv" in m and m["argv"][0] == "-p"
+                   and not m["argv"][1].startswith("--")]
+        assert not app.side_answer.display and not printed
 
 
 async def test_agent_and_thinking(home):
@@ -623,3 +667,174 @@ async def test_ctrl_x_s_with_nothing_queued_says_so(home):
         await ready(pilot)
         await pilot.press("ctrl+x", "ctrl+s")
         assert app.footer.flash_text == "Nothing queued" and not app.busy
+
+
+async def test_ctrl_x_s_works_whatever_has_focus(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "slow")
+        await until(pilot, lambda: app.busy and replies(app))
+        await send(pilot, "hello")
+        app.transcript.focus()
+        await pilot.pause()
+        # ctrl let go and pressed again between the keys: kitty-protocol terminals report it
+        await pilot.press("ctrl+x", "left_control", "ctrl+s")
+        await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy)
+        now = [m for m in sent(home) if m.get("request", {}).get("subtype") == "interrupt"]
+        assert now and now[-1]["request"].get("send_now") is True
+        assert [e.text for e in entries(app, UserEntry)] == ["slow", "hello"]
+
+
+async def test_ctrl_q_unqueues_the_newest(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "very slow")
+        await until(pilot, lambda: app.busy and replies(app))
+        await send(pilot, "hello there")
+        await send(pilot, "oops")
+        await until(pilot, lambda: len(app.query(UnqueueButton)) == 2)
+        await pilot.press("ctrl+q")
+        await until(pilot, lambda: app.queued == ["hello there"])
+        assert app.is_running  # not Textual's quit
+        cancel = [m["request"] for m in sent(home) if m.get("request", {}).get("subtype") == "cancel_async_message"]
+        users = [m for m in sent(home) if m.get("type") == "user"]
+        assert cancel[-1]["message_uuid"] == users[-1]["uuid"]
+        await pilot.press("ctrl+x", "s")
+        await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy)
+        assert [e.text for e in entries(app, UserEntry)] == ["very slow", "hello there"]
+
+
+async def test_clicking_a_queued_prompt_unqueues_it(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "very slow")
+        await until(pilot, lambda: app.busy and replies(app))
+        await send(pilot, "first")
+        await send(pilot, "second")
+        await until(pilot, lambda: len(app.query(UnqueueButton)) == 2)
+        await pilot.click(app.query(UnqueueButton).first())
+        await until(pilot, lambda: app.queued == ["second"])
+        assert len(app.query(UnqueueButton)) == 1
+        await pilot.press("ctrl+q")
+        await until(pilot, lambda: not app.queued and not app.queued_panel.display)
+        await pilot.press("escape")
+        await until(pilot, lambda: not app.busy)
+        assert [e.text for e in entries(app, UserEntry)] == ["very slow"]
+
+
+async def test_ctrl_q_with_nothing_queued(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await pilot.press("ctrl+q")
+        assert app.is_running and app.footer.flash_text == "Nothing queued"
+
+
+async def test_ctrl_brackets_jump_between_your_messages(home):
+    app = make(home)
+    async with app.run_test(size=(100, 20)) as pilot:
+        await ready(pilot)
+        for word in ("table one", "table two", "table three"):
+            await send(pilot, word)
+            await until(pilot, lambda: not app.busy and len(replies(app)) == len(entries(app, UserEntry)))
+        mine = entries(app, UserEntry)
+
+        def at(entry):
+            # at the top of the view (with the gap above it, for one after a reply's own gap)
+            return entry.has_class("picked") and 0 <= entry.virtual_region.y - app.transcript.scroll_y <= 1
+
+        await pilot.press("ctrl+left_square_bracket")  # back from the end: the last one
+        await until(pilot, lambda: at(mine[2]))
+        await pilot.press("ctrl+left_square_bracket")
+        await until(pilot, lambda: at(mine[1]))
+        await pilot.press("ctrl+right_square_bracket")  # and forwards again
+        await until(pilot, lambda: at(mine[2]))
+        await pilot.press("ctrl+right_square_bracket")  # past the last: back to the end
+        await until(pilot, lambda: app.jumped is None and app.transcript.scroll_y == app.transcript.max_scroll_y)
+        assert not any(e.has_class("picked") for e in mine)
+        await pilot.press("ctrl+right_square_bracket")  # from the end, ctrl+] starts at the first
+        await until(pilot, lambda: at(mine[0]))
+
+
+def thread_replies(thread):
+    return [e.text.strip() for e in thread.view.transcript.children if isinstance(e, AssistantEntry)]
+
+
+async def test_manager_hands_the_work_to_threads(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, '/manager "delegate the work"')
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2)
+        assert app.manager_pane.display
+        one, two = app.manager.threads
+        assert (one.title, two.title) == ("Say hello", "Edit the notes")
+        # The coordinator runs with the window's MCP server, its tools always loaded.
+        init = [m for m in sent(home) if (m.get("request") or {}).get("subtype") == "initialize"]
+        assert any(m["request"].get("sdkMcpServers") == ["manager"] for m in init)
+        replies_to_mcp = [((m.get("response") or {}).get("response") or {}).get("mcp_response") for m in sent(home)]
+        listed = [r["result"]["tools"] for r in replies_to_mcp if r and isinstance(r["result"].get("tools"), list)]
+        assert {t["name"] for t in listed[0]} == {"start_thread", "message_thread", "list_threads",
+                                                  "read_thread", "stop_thread"}
+        assert all(t["_meta"]["anthropic/alwaysLoad"] for t in listed[0])
+        # Thread 1 finishes; thread 2 waits on a permission prompt, without taking the keys.
+        await until(pilot, lambda: one.look == "done" and two.look == "attention")
+        assert thread_replies(one) == ["Hello, sir. How may I help?"]
+        assert app.prompt.has_focus and app.dialog is None
+        rows = app.manager_pane.list.render().renderables
+        assert theme.SUCCESS in str(rows[0].spans) and theme.ATTENTION in str(rows[2].spans)
+        assert "needs you" in rows[2].plain and "finished" in rows[0].plain
+        # The coordinator hears how thread 1 went, shown as a line rather than a message of yours.
+        await until(pilot, lambda: "Noted." in replies(app) and not app.busy)
+        notices = [text_of(e.renderable) for e in entries(app, NoticeEntry) if not isinstance(e.renderable, Widget)]
+        assert any("Thread 1 · Say hello · finished" in n for n in notices)
+        assert [e.text for e in entries(app, UserEntry)] == ["delegate the work"]
+        # → on the empty prompt goes to the list; ↓ and Enter open thread 2 at its prompt.
+        await pilot.press("right")
+        assert app.manager_pane.list.has_focus
+        await pilot.press("down", "enter")
+        assert app.manager_pane.opened is two and two.dialog.has_focus
+        await pilot.press("1")
+        await until(pilot, lambda: two.look == "done")
+        assert thread_replies(two) == ["Changed alpha to beta."]
+        assert [e.state for e in two.tools.values()] == ["done"]
+        await until(pilot, lambda: replies(app).count("Noted.") == 2)
+        # ← on the empty message line is back to the list, and ← again to the coordinator.
+        assert two.view.entry.has_focus
+        await pilot.press("left")
+        assert app.manager_pane.opened is None and app.manager_pane.list.has_focus
+        await pilot.press("left")
+        assert app.prompt.has_focus
+
+
+async def test_messaging_a_thread_and_manager_off(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager delegate the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2
+                    and app.manager.threads[0].look == "done")
+        one = app.manager.threads[0]
+        await until(pilot, lambda: not app.busy)
+        noted = replies(app).count("Noted.")
+        await pilot.press("right", "enter")
+        assert app.manager_pane.opened is one and one.view.entry.has_focus
+        await pilot.press(*"think")
+        await pilot.press("enter")
+        await until(pilot, lambda: "It is **391**, sir." in thread_replies(one) and one.look == "done")
+        assert [e.text for e in one.view.transcript.children if isinstance(e, UserEntry)] == ["hello", "think"]
+        await pilot.pause(0.5)
+        assert replies(app).count("Noted.") == noted  # what you ask a thread yourself isn't reported
+        engines = [one.engine, app.manager.threads[1].engine]
+        await pilot.press("escape")  # a thread that's done: Esc is back to the list
+        assert app.manager_pane.list.has_focus
+        await pilot.press("escape")
+        await send(pilot, "/manager off")
+        await until(pilot, lambda: any("manager mode is off" in text_of(e.renderable)
+                                       for e in entries(app, NoticeEntry) if not isinstance(e.renderable, Widget)))
+        assert not app.manager_pane.display and not any(e.running for e in engines)
+        init = [m for m in sent(home) if (m.get("request") or {}).get("subtype") == "initialize"]
+        assert "sdkMcpServers" not in init[-1]["request"]

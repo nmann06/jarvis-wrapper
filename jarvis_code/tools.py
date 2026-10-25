@@ -27,6 +27,10 @@ EXPANDED_LINES = 400     # even ctrl+o stops somewhere
 
 HOME = os.path.expanduser("~")
 
+# Bookkeeping Claude Code doesn't show as tool calls: the task list (drawn under the spinner)
+# and loading deferred tools. ctrl+o shows them.
+QUIET_TOOLS = {"TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "ToolSearch"}
+
 
 def short_path(path, cwd):
     """Relative to the project when inside it, ~/... when under home."""
@@ -107,6 +111,13 @@ def title(name, tool_input, cwd):
     if name == "ExitPlanMode":
         return "Plan", "ready for review"
     mcp = mcp_name(name)
+    if mcp and mcp[0] == "manager":  # the threads of /manager (manager.py)
+        thread = f"#{i['thread']}" if i.get("thread") is not None else ""
+        if mcp[1] == "start_thread":
+            return "Start Thread", one_line(i.get("title", ""), 100)
+        if mcp[1] == "message_thread":
+            return "Message Thread", " ".join(p for p in (thread, one_line(i.get("message", ""), 80)) if p)
+        return mcp[1].replace("_", " ").title(), thread
     if mcp:
         server, tool = mcp
         server = server.removeprefix("claude_ai_").replace("_", " ")
