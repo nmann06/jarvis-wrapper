@@ -736,6 +736,26 @@ async def test_left_arrow_ctrl_f_searches(home, monkeypatch):
         assert app.session_id == "old1"
 
 
+async def test_right_arrow_opens_the_picked_conversation(home, monkeypatch):
+    monkeypatch.chdir(home)
+    save_session(home, home, "old1", "plan the buck converter")
+    save_session(home, home, "old2", "notes on op amps")
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await pilot.press("left")
+        await until(pilot, lambda: app.dialog is not None)
+        picker = app.dialog
+        await pilot.press(*"bu", "left", "right")  # typing a new one: → moves through the text
+        assert app.dialog is picker and picker.filter.value == "bu"
+        await pilot.press("right")  # at the end of it: still the new conversation's text, not a pick
+        assert app.dialog is picker
+        await pilot.press("ctrl+f", "right")  # searching for "bu": → opens the match
+        await until(pilot, lambda: app.dialog is None and app.engine_state == "running"
+                    and [e.text for e in entries(app, UserEntry)] == ["plan the buck converter"])
+        assert app.session_id == "old1"
+
+
 async def test_ctrl_backspace_deletes_a_word(home, monkeypatch):
     from textual import events
     from jarvis_code import app as app_module
@@ -1013,6 +1033,32 @@ async def test_alt_arrows_jump_between_your_messages(home):
         assert not any(e.has_class("picked") for e in mine)
         await pilot.press("alt+down")  # from the end, alt+down starts at the first
         await until(pilot, lambda: at(mine[0]))
+
+
+async def test_ctrl_f_searches_the_conversation(home):
+    app = make(home)
+    async with app.run_test(size=(100, 20)) as pilot:
+        await ready(pilot)
+        for word in ("table one", "chair", "table three"):
+            await send(pilot, word)
+            await until(pilot, lambda: not app.busy and len(replies(app)) == len(entries(app, UserEntry)))
+        mine = entries(app, UserEntry)
+        await pilot.press("ctrl+f")
+        assert app.search_bar.display and app.search_bar.input.has_focus
+        await pilot.press(*"TABLE")
+        await until(pilot, lambda: app.found == [mine[0], mine[2]] and mine[2].has_class("found"))
+        assert str(app.search_bar.count.content).startswith("2 of 2")
+        await pilot.press("up")  # older
+        assert mine[0].has_class("found") and not mine[2].has_class("found")
+        await pilot.press("up")  # round to the newest again
+        assert mine[2].has_class("found")
+        await pilot.press("enter")  # enter goes older too
+        assert mine[0].has_class("found")
+        await pilot.press(*"zzz")
+        await until(pilot, lambda: str(app.search_bar.count.content) == "No matches")
+        assert not any(e.has_class("found") for e in mine)
+        await pilot.press("escape")
+        assert not app.search_bar.display and app.prompt.has_focus and app.is_running
 
 
 def thread_replies(thread):

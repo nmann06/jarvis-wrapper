@@ -35,7 +35,7 @@ from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, 
 from .manager import MANAGER_PROMPT, SERVER, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
-                      Picker, PromptBar, PromptInput, QueuedPanel, SideAnswer, Spinner, SuggestionMenu,
+                      Picker, PromptBar, PromptInput, QueuedPanel, SearchBar, SideAnswer, Spinner, SuggestionMenu,
                       TaskPanel, ThinkingEntry, ToolEntry, Transcript, UserEntry, notice, quote_reply,
                       shortcuts)
 
@@ -377,7 +377,8 @@ class JarvisApp(App):
 
     def window_key(self, key):
         """Keys taken before whatever has focus sees them (the transcript or a dialog may have
-        it): ctrl+x s, ctrl+q (Textual's quit otherwise), alt+up and alt+down, ctrl+r. True if taken."""
+        it): ctrl+x s, ctrl+q (Textual's quit otherwise), alt+up and alt+down, ctrl+r, ctrl+f.
+        True if taken."""
         if self.chord_until and not is_modifier(key):
             pending, self.chord_until = time.monotonic() < self.chord_until, 0.0
             if pending and key in ("s", "ctrl+s"):
@@ -398,6 +399,10 @@ class JarvisApp(App):
             return True
         if key == "ctrl+r" and self.dialog is None:
             self.reply_to_selection()
+            return True
+        if key == "ctrl+f" and self.dialog is None:  # instead of TextArea's delete-word-right
+            self.search_bar.open()
+            self.search(self.search_bar.input.value)
             return True
         return False
 
@@ -437,6 +442,8 @@ class JarvisApp(App):
         self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
         self.jumped = None   # the message of yours alt+up / alt+down last scrolled to
         self.reply = None    # the highlighted text the next prompt replies to (ctrl+r)
+        self.found = []      # the entries matching the ctrl+f search, oldest first
+        self.found_index = -1
         self.pending_context = []  # ! output that goes along with the next prompt
         self.history = []
         self.history_index = -1
@@ -482,6 +489,7 @@ class JarvisApp(App):
                 yield QueuedPanel(id="queued")
                 with Vertical(id="dock"):
                     yield SideAnswer(id="btw")
+                    yield SearchBar(id="search")
                     yield PromptBar(id="prompt-bar")
                 yield SuggestionMenu(id="menu")
             yield ManagerPane(id="manager")  # /manager's threads, on the right
@@ -496,6 +504,7 @@ class JarvisApp(App):
         self.task_panel = self.query_one(TaskPanel)
         self.queued_panel = self.query_one(QueuedPanel)
         self.side_answer = self.query_one(SideAnswer)
+        self.search_bar = self.query_one(SearchBar)
         self.manager_pane = self.query_one(ManagerPane)
         self.dock = self.query_one("#dock")
         self.prompt_bar = self.query_one(PromptBar)
@@ -1896,8 +1905,10 @@ class JarvisApp(App):
         title = f"Resume a conversation ({len(found)}, every folder)" if everywhere else "Resume a conversation"
         if new:
             title = title.replace("Resume a conversation", "Conversations", 1)
-            return await self.show_dialog(Picker(title, items, new_text="Type to start a new conversation…"))
-        return await self.show_dialog(Picker(title, items))
+            return await self.show_dialog(Picker(title, items, new_text="Type to start a new conversation…",
+                                                 open_on_right=True))
+        return await self.show_dialog(Picker(title, items, open_on_right=True,
+                                             hint="Type to filter · ↑↓ to scroll · Enter or → to pick · Esc to cancel"))
 
     def show_all_sessions(self):
         """Left arrow on an empty prompt: every saved conversation, from every folder."""
@@ -2437,6 +2448,42 @@ class JarvisApp(App):
             return
         self.screen.clear_selection()
         self.set_reply(selected)
+        self.prompt.focus()
+
+    def search(self, text):
+        """The entries with text in them (any case), newest on show."""
+        query = text.strip().lower()
+        self.show_found(None)
+        self.found = [e for e in self.transcript.children
+                      if query and isinstance(e, Entry) and e.display and query in e.plain().lower()]
+        if self.found:
+            self.show_found(len(self.found) - 1)
+        self.search_bar.set_count("" if not query else "No matches" if not self.found else self.found_count())
+
+    def found_count(self):
+        return f"{self.found_index + 1} of {len(self.found)} · ↑↓ · esc"
+
+    def show_found(self, index):
+        if 0 <= self.found_index < len(self.found):
+            self.found[self.found_index].remove_class("found")
+        self.found_index = -1 if index is None else index
+        if index is not None:
+            entry = self.found[index]
+            entry.add_class("found")
+            self.transcript.scroll_to_widget(entry, top=True, animate=False)
+
+    def on_search_bar_changed(self, event):
+        self.search(event.text)
+
+    def on_search_bar_step(self, event):
+        if self.found:  # around from the oldest to the newest, and back
+            self.show_found((self.found_index + event.step) % len(self.found))
+            self.search_bar.set_count(self.found_count())
+
+    def on_search_bar_closed(self, event):
+        self.show_found(None)
+        self.found = []
+        self.search_bar.close()
         self.prompt.focus()
 
     def set_reply(self, quoted):

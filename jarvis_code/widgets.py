@@ -98,11 +98,12 @@ class CollapseButton(Static):
 class Entry(Horizontal):
     """One thing in the transcript: a glyph in a two-column gutter, then the body."""
 
-    DEFAULT_CSS = """
-    Entry { height: auto; margin-top: 1; }
-    Entry.attached, Entry.after-reply { margin-top: 0; }
-    Entry > .gutter { width: 2; height: auto; }
-    Entry > .body { width: 1fr; height: auto; }
+    DEFAULT_CSS = f"""
+    Entry {{ height: auto; margin-top: 1; }}
+    Entry.attached, Entry.after-reply {{ margin-top: 0; }}
+    Entry.found {{ background: {theme.PICKED_BG}; }}  /* the ctrl+f match on show */
+    Entry > .gutter {{ width: 2; height: auto; }}
+    Entry > .body {{ width: 1fr; height: auto; }}
     """
 
     def __init__(self, glyph, glyph_style, body, classes=""):
@@ -621,6 +622,72 @@ class SideAnswer(Static):
         self.display = False
 
 
+class SearchBar(Horizontal):
+    """ctrl+f: find in the conversation. Enter or ↑ goes to an older match, ↓ to a newer one,
+    esc closes it."""
+
+    DEFAULT_CSS = f"""
+    SearchBar {{ height: 1; margin-top: 1; display: none; }}
+    SearchBar > .label {{ width: auto; color: {theme.ACCENT}; }}
+    SearchBar > Input {{ width: 1fr; height: 1; border: none; padding: 0; background: transparent; }}
+    SearchBar > Input:focus {{ border: none; }}
+    SearchBar > .count {{ width: auto; color: {theme.DIM}; }}
+    """
+
+    class Changed(Message):
+        def __init__(self, text):
+            super().__init__()
+            self.text = text
+
+    class Step(Message):
+        def __init__(self, step):
+            super().__init__()
+            self.step = step  # -1 for an older match, 1 for a newer one
+
+    class Closed(Message):
+        pass
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.input = Input(placeholder="Search the conversation")
+        self.count = Static("", classes="count")
+
+    def compose(self):
+        yield Static("Find: ", classes="label")
+        yield self.input
+        yield self.count
+
+    def open(self):
+        self.display = True
+        self.input.focus()
+        self.input.select_all()
+
+    def close(self):
+        self.display = False
+
+    def set_count(self, text):
+        self.count.update(text)
+
+    def on_input_changed(self, event):
+        event.stop()
+        self.post_message(self.Changed(event.value))
+
+    def on_input_submitted(self, event):
+        event.stop()
+        self.post_message(self.Step(-1))
+
+    def on_key(self, event):
+        steps = {"up": -1, "down": 1}
+        if event.key in steps:
+            self.post_message(self.Step(steps[event.key]))
+        elif event.key == "escape":
+            self.post_message(self.Closed())
+        else:
+            return
+        event.stop()
+        event.prevent_default()
+
+
 # Prompt ---------------------------------------------------------------------------------------
 
 class HRule(Static):
@@ -871,6 +938,7 @@ SHORTCUTS = [
     ("ctrl+x s to send now", "← for conversations"),
     ("ctrl+q to unqueue the last prompt", "alt+↑ / alt+↓ to jump between your messages"),
     ("→ for the threads of /manager", "ctrl+r to reply to the highlighted text"),
+    ("ctrl+f to search the conversation", ""),
 ]
 
 
@@ -1041,15 +1109,18 @@ class Picker(Dialog):
 
     With new_text (the left-arrow list of conversations), the line on top is for something new
     instead: typed there and sent with Enter, it resolves to ("new", text). ctrl+f turns it into
-    the filter and back; Esc while searching goes back to typing something new."""
+    the filter and back; Esc while searching goes back to typing something new. With
+    open_on_right (the lists of conversations), → picks too, once the line has nothing more to
+    move through."""
 
     ROWS = 9
-    NEW_HINT = "Type to start a new one · ctrl+f to search · ↑↓ to scroll · Enter to pick · Esc to cancel"
-    SEARCH_HINT = "Type to search · ctrl+f or Esc to stop searching · ↑↓ to scroll · Enter to pick"
+    NEW_HINT = "Type to start a new one · ctrl+f to search · ↑↓ to scroll · Enter or → to pick · Esc to cancel"
+    SEARCH_HINT = "Type to search · ctrl+f or Esc to stop searching · ↑↓ to scroll · Enter or → to pick"
 
     def __init__(self, title, items, hint="Type to filter · ↑↓ to scroll · Enter to pick · Esc to cancel",
-                 new_text=None):
+                 new_text=None, open_on_right=False):
         self.all_items = items  # (value, label, description)
+        self.open_on_right = open_on_right
         self.new_text = new_text  # placeholder of the line when it's for something new
         self.searching = new_text is None
         self.filter = Input(placeholder="Type to search…" if self.searching else new_text, compact=True)
@@ -1127,6 +1198,9 @@ class Picker(Dialog):
                 self.point_at(self.cursor + steps[key])
         elif key == "enter":
             self.pick()
+        elif (key == "right" and self.open_on_right and self.filter.cursor_position >= len(self.filter.value)
+              and (self.searching or not self.filter.value.strip())):
+            self.pick()  # not while typing a new conversation's first prompt
         elif key == "ctrl+f" and self.new_text is not None:
             self.set_searching(not self.searching)
         elif key == "escape" and self.new_text is not None and self.searching:
@@ -1149,6 +1223,6 @@ class Transcript(VerticalScroll):
 
 
 __all__ = ["Banner", "Entry", "UserEntry", "AssistantEntry", "ThinkingEntry", "ToolEntry",
-           "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "UnqueueButton", "PromptBar",
+           "NoticeEntry", "DoneEntry", "Spinner", "TaskPanel", "QueuedPanel", "UnqueueButton", "PromptBar", "SearchBar",
            "PromptInput", "SuggestionMenu", "Footer", "Dialog", "Picker", "Transcript",
            "notice", "shortcuts", "elapsed", "quote_reply", "split_reply"]
