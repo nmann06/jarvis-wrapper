@@ -24,6 +24,7 @@ COLLAPSED_LINES = 4      # output lines shown before "… +N lines (ctrl+o to ex
 COLLAPSED_DIFF = 40
 COLLAPSED_WRITE = 8
 EXPANDED_LINES = 400     # even ctrl+o stops somewhere
+RUNNING_COMMAND = 3      # rows of a Bash command shown while it runs; one row once it's done
 
 HOME = os.path.expanduser("~")
 
@@ -125,8 +126,12 @@ def title(name, tool_input, cwd):
     return name, short_args(i)
 
 
-def header(name, tool_input, cwd, pending=False):
+def header(name, tool_input, cwd, pending=False, full=None):
+    """full: show that many lines of a Bash command, as written, instead of one line."""
     label, arg = title(name, tool_input, cwd)
+    if full and name == "Bash":
+        lines = (tool_input or {}).get("command", "").strip().split("\n")
+        arg = "\n".join(lines[:full]) + ("\n…" if len(lines) > full else "")
     text = Text(label, style="bold")
     if arg or pending:
         text.append("(")

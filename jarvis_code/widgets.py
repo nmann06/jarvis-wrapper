@@ -3,9 +3,10 @@ spinner, task list, prompt, suggestion menu, footer, and the dialogs that take t
 place when Claude Code asks for permission or has a question."""
 
 import asyncio
+import io
 import time
 
-from rich.console import Group
+from rich.console import Console, Group
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table
 from rich.text import Text
@@ -71,6 +72,29 @@ class Banner(Static):
 
 # Transcript entries ---------------------------------------------------------------------------
 
+def rendered(renderable):
+    """A renderable as plain text, to tell whether expanding it would show any more."""
+    console = Console(width=200, file=io.StringIO(), color_system=None)
+    console.print(renderable)
+    return console.file.getvalue()
+
+
+class CollapseButton(Static):
+    """▲ collapse, under an entry a click opened; folds it back."""
+
+    DEFAULT_CSS = f"""
+    CollapseButton {{ width: auto; margin-left: 3; color: {theme.LABEL}; display: none; }}
+    CollapseButton:hover {{ color: {theme.ACCENT}; }}
+    """
+
+    def __init__(self):
+        super().__init__(Text("▲ collapse"))
+
+    def on_click(self, event):
+        event.stop()
+        self.query_ancestor(Entry).collapse()
+
+
 class Entry(Horizontal):
     """One thing in the transcript: a glyph in a two-column gutter, then the body."""
 
@@ -93,6 +117,9 @@ class Entry(Horizontal):
 
     def set_glyph(self, glyph, style):
         self.glyph_view.update(Text(glyph, style=style))
+
+    def collapse(self):
+        pass
 
     def plain(self):
         return ""
@@ -151,15 +178,17 @@ class ThinkingEntry(Entry):
         self.duration = None
         self.done = done  # a thought from a saved conversation: how long it took isn't known
         self.expanded = verbose
+        self.opened = False  # clicked open, with ctrl+o off
         self.view = Static()
-        super().__init__("∴", f"italic {theme.ACCENT}", self.view)
+        self.collapse_button = CollapseButton()
+        super().__init__("∴", f"italic {theme.ACCENT}", Vertical(self.view, self.collapse_button))
 
     def on_mount(self):
         self.redraw()
 
     def append(self, fragment):
         self.text += fragment
-        if self.expanded:
+        if self.expanded or self.opened:
             self.redraw()
 
     def finish(self, text=None):
@@ -172,12 +201,20 @@ class ThinkingEntry(Entry):
 
     def set_verbose(self, verbose):
         self.expanded = verbose
+        self.opened = False
         self.redraw()
 
     def on_click(self):
-        self.set_verbose(not self.expanded)
+        if not self.expanded and not self.opened and self.text.strip():
+            self.opened = True
+            self.redraw()
+
+    def collapse(self):
+        self.opened = False
+        self.redraw()
 
     def redraw(self):
+        self.collapse_button.display = self.opened and bool(self.text.strip())
         if not self.done:
             label = Text("Thinking…", style=f"italic {theme.ACCENT}")
         elif self.duration is None:
@@ -186,7 +223,7 @@ class ThinkingEntry(Entry):
             label = Text(f"Thought for {max(1, round(self.duration))}s", style=f"italic {theme.ACCENT}")
         if not self.text.strip():
             self.view.update(label)
-        elif self.expanded:
+        elif self.expanded or self.opened:
             self.view.update(Group(label, Text(self.text.strip(), style=f"italic {theme.DIM}")))
         else:
             self.view.update(label + Text(" (ctrl+o to expand)", style=theme.DIM))
@@ -201,6 +238,7 @@ class ToolEntry(Entry):
     DEFAULT_CSS = """
     ToolEntry > .body > .progress { height: auto; }
     ToolEntry > .body > .result { height: auto; }
+    ToolEntry > .body > .oneline { text-wrap: nowrap; text-overflow: ellipsis; }
     """
 
     def __init__(self, tool_id, name, tool_input, cwd, verbose=False):
@@ -212,10 +250,13 @@ class ToolEntry(Entry):
         self.activity = ""
         self.waiting = False  # for the permission dialog
         self.input_complete = bool(tool_input)
+        self.opened = False  # clicked open, with ctrl+o off
         self.header_view = Static()
         self.progress_view = Static(classes="progress")
         self.result_view = Static(classes="result")
-        super().__init__(theme.BULLET, theme.DIM, Vertical(self.header_view, self.progress_view, self.result_view))
+        self.collapse_button = CollapseButton()
+        super().__init__(theme.BULLET, theme.DIM, Vertical(self.header_view, self.progress_view, self.result_view,
+                                                            self.collapse_button))
 
     def on_mount(self):
         self.redraw()
@@ -250,7 +291,33 @@ class ToolEntry(Entry):
 
     def set_verbose(self, verbose):
         self.verbose = verbose
+        self.opened = False
         self.redraw()
+
+    def on_click(self):
+        if not self.verbose and not self.opened and self.expandable():
+            self.opened = True
+            self.redraw()
+
+    def collapse(self):
+        self.opened = False
+        self.redraw()
+
+    def expandable(self):
+        """Whether a click would show more: the whole command, an agent's calls, more output."""
+        if self.tool_name == "Bash" and self.state != "running":
+            short = tools.header(self.tool_name, self.input, self.cwd).plain
+            whole = tools.header(self.tool_name, self.input, self.cwd, full=tools.EXPANDED_LINES).plain
+            if short != whole or len(short) > self.header_view.size.width:
+                return True
+        if len(self.children_calls) > (0 if self.state != "running" else 3):
+            return True
+        if self.result_args is None or self.state not in ("done", "error"):
+            return False
+        content, data, is_error = self.result_args
+        folded, unfolded = (tools.result(self.tool_name, self.input, content, data, is_error, self.cwd, verbose)
+                            for verbose in (False, True))
+        return rendered(folded or "") != rendered(unfolded or "")
 
     def set_waiting(self, waiting):
         self.waiting = waiting
@@ -264,19 +331,40 @@ class ToolEntry(Entry):
         colour = {"running": theme.DIM, "done": None, "error": theme.ERROR,
                   "rejected": theme.ERROR, "interrupted": theme.ERROR}[self.state]
         self.set_glyph(theme.BULLET if colour else " ", colour or "")
-        self.header_view.update(tools.header(self.tool_name, self.input, self.cwd,
-                                             pending=not self.input_complete))
-        progress = self._progress()
+        expanded = self.verbose or self.opened
+        full = tools.EXPANDED_LINES if expanded else tools.RUNNING_COMMAND if self.state == "running" else None
+        self.header_view.set_class(self.tool_name == "Bash" and not full, "oneline")
+        header = tools.header(self.tool_name, self.input, self.cwd, pending=not self.input_complete, full=full)
+        if self.tool_name == "Bash" and full == tools.RUNNING_COMMAND:
+            header = self._first_rows(header, full)
+        self.header_view.update(header)
+        progress = self._progress(expanded)
         self.progress_view.update(progress)
         self.progress_view.display = bool(progress)
-        result = self._result()
+        result = self._result(expanded)
         self.result_view.update(result)
         self.result_view.display = bool(result)
+        self.collapse_button.display = self.opened
 
-    def _progress(self):
-        if self.state != "running" and not self.verbose:
+    def on_resize(self):
+        if self.tool_name == "Bash" and self.state == "running":
+            self.redraw()  # the running command's rows are cut to the width
+
+    def _first_rows(self, text, rows):
+        """The header as wrapped on screen, cut to rows with an ellipsis."""
+        width = self.header_view.size.width or max(20, self.app.size.width - 4)
+        lines = text.wrap(self.app.console, width)
+        if len(lines) <= rows:
+            return text
+        last = lines[rows - 1]
+        last.truncate(width - 1)
+        last.append("…")
+        return Text("\n").join(lines[:rows])
+
+    def _progress(self, expanded):
+        if self.state != "running" and not expanded:
             return ""
-        calls = self.children_calls if self.verbose else self.children_calls[-3:]
+        calls = self.children_calls if expanded else self.children_calls[-3:]
         rows = []
         for _, name, tool_input, state in calls:
             row = tools.header(name, tool_input, self.cwd)
@@ -290,7 +378,7 @@ class ToolEntry(Entry):
             rows.append(Text(self.activity, style=theme.DIM))
         return tools.block(rows) if rows else ""
 
-    def _result(self):
+    def _result(self, expanded):
         if self.state == "rejected":
             return tools.rejected()
         if self.state == "interrupted":
@@ -300,7 +388,7 @@ class ToolEntry(Entry):
                 return tools.block([Text("Running…", style=theme.DIM)])
             return ""
         content, data, is_error = self.result_args
-        view = tools.result(self.tool_name, self.input, content, data, is_error, self.cwd, self.verbose)
+        view = tools.result(self.tool_name, self.input, content, data, is_error, self.cwd, expanded)
         return view if view is not None else ""
 
     def plain(self):
@@ -320,16 +408,35 @@ class NoticeEntry(Entry):
 
     def __init__(self, renderable=None, attached=True, glyph="", glyph_style="", draw=None, verbose=False):
         self.draw = draw
+        self.verbose = verbose
+        self.opened = False  # clicked open, with ctrl+o off
         if draw:
             renderable = draw(verbose)
         self.renderable = renderable
-        body = renderable if isinstance(renderable, Widget) else Static(renderable)
+        self.view = renderable if isinstance(renderable, Widget) else Static(renderable)
+        self.collapse_button = CollapseButton()
+        body = Vertical(self.view, self.collapse_button) if draw else self.view
         super().__init__(glyph, glyph_style, body, classes="attached" if attached else "")
 
     def set_verbose(self, verbose):
+        self.verbose = verbose
+        self.opened = False
+        self.redraw()
+
+    def on_click(self):
+        if self.draw and not self.verbose and not self.opened and rendered(self.draw(False)) != rendered(self.draw(True)):
+            self.opened = True
+            self.redraw()
+
+    def collapse(self):
+        self.opened = False
+        self.redraw()
+
+    def redraw(self):
         if self.draw:
-            self.renderable = self.draw(verbose)
-            self.body.update(self.renderable)
+            self.renderable = self.draw(self.verbose or self.opened)
+            self.view.update(self.renderable)
+            self.collapse_button.display = self.opened
 
     def plain(self):
         return str(self.renderable) if isinstance(self.renderable, (str, Text)) else ""
@@ -494,7 +601,7 @@ class PromptInput(TextArea):
     """The prompt. Enter sends (queued while Jarvis is busy; ctrl+x s, handled by the app,
     sends now);
     \\+Enter, ctrl+j or alt+enter start a new line; the arrows walk
-    the suggestion menu when it's open and the prompt history at the first or last line."""
+    the suggestion menu when it's open and the prompt history from the first or last row on screen."""
 
     DEFAULT_CSS = f"""
     PromptInput {{ height: auto; max-height: 12; border: none; padding: 0; background: transparent; }}
@@ -558,16 +665,22 @@ class PromptInput(TextArea):
     def action_cursor_up(self, select=False):
         if not select and self.app.menu_move(-1):
             return
-        if not select and self.cursor_location[0] == 0 and self.app.history_move(-1):
+        if not select and self.navigator.is_first_wrapped_line(self.cursor_location) and self.app.history_move(-1):
             return
         super().action_cursor_up(select)
 
     def action_cursor_down(self, select=False):
         if not select and self.app.menu_move(1):
             return
-        if not select and self.cursor_location[0] == self.document.line_count - 1 and self.app.history_move(1):
+        if not select and self.navigator.is_last_wrapped_line(self.cursor_location) and self.app.history_move(1):
             return
         super().action_cursor_down(select)
+
+    async def _on_mouse_up(self, event):
+        await super()._on_mouse_up(event)
+        if self.selected_text:  # dragged over: copied, as a terminal would
+            self.app.copy_text(self.selected_text)
+            self.app.footer.flash("Copied")
 
     def action_delete_right(self):
         if not self.text:

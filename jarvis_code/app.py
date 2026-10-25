@@ -178,6 +178,30 @@ def console_title(title=None):
     buf = ctypes.create_unicode_buffer(1024)
     return buf.value if kernel32.GetConsoleTitleW(buf, len(buf)) else None
 
+def system_copy(text):
+    """Puts text on the clipboard with the system's own command, for terminals that ignore
+    OSC 52 (VTE ones: xfce4-terminal, GNOME Terminal; macOS Terminal). False if there's none."""
+    if sys.platform == "darwin":
+        commands = [["pbcopy"]]
+    elif sys.platform.startswith("linux"):
+        commands = [["wl-copy"]] if os.environ.get("WAYLAND_DISPLAY") else []
+        if os.environ.get("DISPLAY"):
+            commands += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    else:
+        return False  # Windows Terminal takes OSC 52
+    for command in commands:
+        if shutil.which(command[0]):
+            try:
+                proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, start_new_session=True)
+                proc.stdin.write(text.encode())
+                proc.stdin.close()
+                return True
+            except OSError:
+                continue
+    return False
+
+
 def user_text(content):
     if isinstance(content, str):
         return content
@@ -1404,6 +1428,19 @@ class JarvisApp(App):
     def on_queued_panel_unqueue(self, event):
         self.unqueue(event.message_uuid)
 
+    def copy_text(self, text):
+        """Copies text by OSC 52, for terminals that take it (and over ssh), and by the system's
+        own clipboard command, for those that don't."""
+        self.copy_to_clipboard(text)
+        system_copy(text)
+
+    def on_text_selected(self, event):
+        """Text selected with the mouse is copied, as a terminal would."""
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_text(selected)
+            self.footer.flash("Copied")
+
     async def submission_loop(self):
         """Prompts run here, one at a time and in order, never in a key handler: a command
         that opens a dialog (/resume, /model) waits for keys a key handler would hold up."""
@@ -2041,7 +2078,7 @@ class JarvisApp(App):
         if not replies:
             self.footer.flash("Nothing to copy yet")
             return
-        self.copy_to_clipboard(replies[-1].text)
+        self.copy_text(replies[-1].text)
         self.footer.flash("Copied Jarvis's last reply")
 
     async def cmd_export(self, args):
@@ -2101,8 +2138,12 @@ class JarvisApp(App):
 
     def action_ctrl_c(self):
         selected = self.screen.get_selected_text()
+        if not selected and self.prompt.has_focus and self.prompt.selected_text:
+            self.copy_text(self.prompt.selected_text)
+            self.footer.flash("Copied")
+            return
         if selected:
-            self.copy_to_clipboard(selected)
+            self.copy_text(selected)
             self.screen.clear_selection()
             self.footer.flash("Copied")
             return

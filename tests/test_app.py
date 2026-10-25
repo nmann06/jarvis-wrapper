@@ -305,6 +305,40 @@ async def test_shell_output_unfolds_with_ctrl_o(home):
         assert "+8 lines" in text_of(entries(app, NoticeEntry)[-1].renderable)
 
 
+async def test_click_unfolds_shell_output_and_collapse_folds_it(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "!seq 1 12")
+        await until(pilot, lambda: any("+8 lines" in text_of(n.renderable) for n in entries(app, NoticeEntry)))
+        notice = entries(app, NoticeEntry)[-1]
+        await pilot.click(notice.view)
+        assert "12" in text_of(notice.renderable) and notice.collapse_button.display
+        await pilot.click(notice.collapse_button)
+        assert "+8 lines" in text_of(notice.renderable) and not notice.collapse_button.display
+
+
+async def test_bash_command_folds_to_one_line_and_click_unfolds_it(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "run bash")
+        await until(pilot, lambda: app.dialog is not None)
+        tool = entries(app, ToolEntry)[0]
+        assert not tool.header_view.has_class("oneline")  # the whole command while it runs
+        await pilot.press("enter")
+        await until(pilot, lambda: not app.busy and replies(app))
+        assert tool.header_view.has_class("oneline")  # one line once it's done
+        assert "+8 lines" in text_of(tool.result_view.content) and not tool.collapse_button.display
+        await pilot.click(tool.header_view)
+        assert "+8 lines" not in text_of(tool.result_view.content) and tool.collapse_button.display
+        await pilot.click(tool.collapse_button)
+        assert "+8 lines" in text_of(tool.result_view.content) and not tool.collapse_button.display
+        await pilot.click(tool.header_view)
+        await pilot.press("ctrl+o")  # ctrl+o takes over from the click
+        assert not tool.collapse_button.display
+
+
 async def test_btw_answers_aside(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
@@ -667,6 +701,47 @@ async def test_ctrl_x_s_with_nothing_queued_says_so(home):
         await ready(pilot)
         await pilot.press("ctrl+x", "ctrl+s")
         assert app.footer.flash_text == "Nothing queued" and not app.busy
+
+
+async def test_up_arrow_walks_wrapped_rows_before_history(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        app.history = ["older prompt"]
+        long = " ".join(f"word{n}" for n in range(60))  # wraps to a few rows, one line
+        app.prompt.set_text(long)
+        await pilot.pause()
+        rows = 0
+        while app.prompt.text == long:
+            await pilot.press("up")
+            rows += 1
+            assert rows < 10
+        assert app.prompt.text == "older prompt" and rows > 1  # the rows above first, then history
+        app.prompt.set_text("one\ntwo\nthree")
+        await pilot.pause()
+        await pilot.press("up")
+        assert app.prompt.text == "one\ntwo\nthree" and app.prompt.cursor_location[0] == 1
+
+
+async def test_selected_text_is_copied(home):
+    from textual import events
+    from textual.selection import Selection
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        app.prompt.set_text("hello world")
+        app.prompt.selection = Selection((0, 0), (0, 5))
+        await pilot.press("ctrl+c")
+        assert app.clipboard == "hello" and app.prompt.text == "hello world"  # copied, not cleared
+        await send(pilot, "hello")
+        await until(pilot, lambda: not app.busy and replies(app))
+        reply = entries(app, AssistantEntry)[-1]
+        target = next(w for w in reply.walk_children()
+                      if w.allow_select and "Hello" in str((w.get_selection(Selection(None, None)) or [""])[0]))
+        app.screen.selections = {target: Selection(None, None)}
+        app.screen.post_message(events.TextSelected())
+        await pilot.pause()
+        assert app.clipboard and app.clipboard.strip() in reply.text
 
 
 async def test_ctrl_x_s_works_whatever_has_focus(home):

@@ -578,7 +578,7 @@ class SettingsPanel(Panel):
         if key == "ctrl+s":
             data = self.data.get("stats")
             if data is not None:
-                self.app.copy_to_clipboard(self.stats_text(data))
+                self.app.copy_text(self.stats_text(data))
                 self.message = "Copied the stats"
             return True
         return False
