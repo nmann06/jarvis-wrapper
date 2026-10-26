@@ -18,8 +18,10 @@ import sys
 import tempfile
 import time
 import uuid
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 
 from rich.console import Group
 from rich.text import Text
@@ -246,6 +248,31 @@ def system_copy(text):
             except OSError:
                 continue
     return False
+
+
+def over_ssh():
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+
+
+def open_here(target):
+    """Opens a URL or file with the system's own handler, on the screen in front of the owner.
+    False where that can't be done: over ssh (it would open on the other computer's screen, if
+    anywhere) or on Linux with no display."""
+    if over_ssh() or (sys.platform.startswith("linux")
+                      and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))):
+        return False
+    try:
+        if sys.platform == "win32":
+            os.startfile(target)
+            return True
+        command = "open" if sys.platform == "darwin" else "xdg-open"
+        if shutil.which(command):
+            subprocess.Popen([command, target], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        return webbrowser.open(target)
+    except OSError:
+        return False
 
 
 def user_text(content):
@@ -1542,6 +1569,25 @@ class JarvisApp(App):
 
     def on_queued_panel_unqueue(self, event):
         self.unqueue(event.message_uuid)
+
+    def open_url(self, url, *, new_tab=True):
+        """A link clicked in a reply (Textual calls this): a web link opens in the browser, and
+        a file Claude linked to (a path from the folder, maybe with #L42) in its own app. Where
+        nothing can be opened (over ssh, or no display) it's copied instead, so it can be
+        pasted on the computer in front of the owner."""
+        target, what = url, "link"
+        if url.lower().startswith("file://"):
+            target, what = unquote(urlparse(url).path), "path"
+        elif not re.match(r"[a-z][a-z0-9+.-]+:", url, re.I) and not url.startswith("#"):
+            path = os.path.join(self.cwd, os.path.expanduser(unquote(url.split("#")[0])))
+            if os.path.exists(path):
+                target, what = os.path.abspath(path), "path"
+        if open_here(target):
+            self.footer.flash(f"Opened {url}", 2)
+            return
+        self.copy_text(target)
+        why = "over ssh" if over_ssh() else "with no browser here"
+        self.footer.flash(f"Copied the {what} ({why}): {target}", 4)
 
     def copy_text(self, text):
         """Copies text by OSC 52, for terminals that take it (and over ssh), and by the system's

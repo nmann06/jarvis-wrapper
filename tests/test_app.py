@@ -361,6 +361,53 @@ async def test_btw_answers_aside(home):
         assert not app.side_answer.display and not app.busy
 
 
+async def click_link(pilot, entry, href):
+    from textual.widgets._markdown import MarkdownBlock
+    for block in entry.query(MarkdownBlock):
+        for span in block._content.spans:
+            if href in str(span.style):
+                await pilot.click(block, offset=(span.start + 1, 0))
+                await pilot.pause(0.2)
+                return
+    raise AssertionError(f"no link to {href}")
+
+
+async def test_links_copied_over_ssh(home, monkeypatch):
+    monkeypatch.setenv("SSH_CONNECTION", "100.1.1.1 5000 100.2.2.2 22")
+    copied = []
+    monkeypatch.setattr(app_module, "system_copy", copied.append)
+    monkeypatch.setattr(app_module.webbrowser, "open", lambda *a, **k: pytest.fail("opened over ssh"))
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        entry = AssistantEntry("See [the docs](https://example.com/docs), [notes](notes.txt#L1) "
+                               "and https://bare.example.org/x")
+        await app.transcript.mount(entry)
+        await pilot.pause(0.2)
+        await click_link(pilot, entry, "https://example.com/docs")
+        assert copied[-1] == "https://example.com/docs" and "over ssh" in app.footer.flash_text
+        await click_link(pilot, entry, "notes.txt#L1")
+        assert copied[-1] == str(home / "notes.txt")  # a file in the folder: its full path
+        await click_link(pilot, entry, "https://bare.example.org/x")  # bare URLs are links too
+        assert copied[-1] == "https://bare.example.org/x"
+
+
+async def test_links_open_locally(home, monkeypatch):
+    for name in ("SSH_CONNECTION", "SSH_TTY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+    opened = []
+    monkeypatch.setattr(app_module, "open_here", lambda target: opened.append(target) or True)
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        entry = AssistantEntry("[the docs](https://example.com/docs)")
+        await app.transcript.mount(entry)
+        await pilot.pause(0.2)
+        await click_link(pilot, entry, "https://example.com/docs")
+        assert opened == ["https://example.com/docs"] and app.footer.flash_text.startswith("Opened")
+
+
 async def test_btw_without_a_question(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
