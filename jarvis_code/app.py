@@ -32,7 +32,7 @@ from textual.widgets import Markdown, Static
 
 from . import __version__, config_items, files, persona, sessions, stats, theme, tools
 from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment
-from .manager import MANAGER_PROMPT, SERVER, Manager, ManagerPane, update_notice
+from .manager import MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
                       Picker, PromptBar, PromptInput, QueuedPanel, SearchBar, SideAnswer, Spinner,
@@ -48,6 +48,7 @@ SETTINGS = os.path.expanduser("~/.claude/jarvis-window.json")  # the window's ow
 # at most this many times in a row (a limit that's still there when it says it reset).
 KEEP_GOING_PROMPT = "The usage limit has reset. Carry on with what you were doing."
 KEEP_GOING_TRIES = 3
+MAX_THREAD_LIMIT = 50  # /manager-thread-limit at most: each thread is a Claude Code of its own
 
 # Headless Claude Code doesn't title conversations, so the window asks for one (for the tab
 # and /resume) in a separate, unsaved `claude -p` on Haiku, with no tools.
@@ -86,6 +87,7 @@ LOCAL_COMMANDS = {
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
     "btw": "Ask a quick side question without interrupting or adding to the conversation",
     "manager": "Project manager mode: Jarvis hands the work to worker Jarvises (/manager off to stop)",
+    "manager-thread-limit": f"How many /manager threads work at once, at every level (default {THREAD_LIMIT})",
     "finished": "Mark this conversation as finished in the list of conversations (/finished off to undo)",
     "keepitgoin": "Carry on by itself when a usage limit resets (/keepitgoin on|off; no args toggles)",
     "computer": "Show which computer this window is running on",
@@ -145,6 +147,12 @@ def load_setting(key, default):
             return json.load(f).get(key, default)
     except (OSError, ValueError, AttributeError):
         return default
+
+
+def thread_limit():
+    """/manager-thread-limit's saved value, or the default."""
+    value = load_setting("manager_thread_limit", None)
+    return value if isinstance(value, int) and 1 <= value <= MAX_THREAD_LIMIT else THREAD_LIMIT
 
 
 def save_setting(key, value):
@@ -438,6 +446,7 @@ class JarvisApp(App):
         self.sent = []       # [text, shown, uuid] prompts not yet taken in by Claude Code
         self.updates = set() # uuids of /manager's thread updates not yet taken in
         self.manager = None  # project manager mode's threads (manager.py), when it's on
+        self.thread_limit = thread_limit()  # /manager-thread-limit
         self.capabilities = set()  # what Claude Code says it can do, on system/init
         self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
         self.jumped = None   # the message of yours alt+up / alt+down last scrolled to
@@ -1736,6 +1745,8 @@ class JarvisApp(App):
             self.cmd_btw(args)
         elif name == "manager":
             await self.cmd_manager(args)
+        elif name == "manager-thread-limit":
+            await self.cmd_thread_limit(args)
         elif name == "keepitgoin":
             await self.cmd_keep_going(args)
         elif name == "finished":
@@ -1819,6 +1830,22 @@ class JarvisApp(App):
             return
         if args:
             await self.send_prompt(args)
+
+    async def cmd_thread_limit(self, args):
+        """/manager-thread-limit [n]: how many /manager threads may work at once, counting
+        every level (saved, for new windows too)."""
+        if not args:
+            await self.note(f"Up to {self.thread_limit} /manager threads work at once, counting every level. "
+                            f"/manager-thread-limit <n> changes it (default {THREAD_LIMIT}).")
+            return
+        value = THREAD_LIMIT if args.lower() == "default" else int(args) if args.isdigit() else 0
+        if not 1 <= value <= MAX_THREAD_LIMIT:
+            self.footer.flash(f"Usage: /manager-thread-limit <1 to {MAX_THREAD_LIMIT}|default>", 3)
+            return
+        self.thread_limit = value
+        save_setting("manager_thread_limit", None if value == THREAD_LIMIT else value)
+        await self.note(f"Up to {value} /manager thread{'s' if value != 1 else ''} work at once now, "
+                        "counting every level.")
 
     async def leave_manager(self):
         if self.manager is None:

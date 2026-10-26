@@ -1,7 +1,8 @@
 """A stand-in for `claude -p` in stream-json mode, for testing the window without spending
 anything: it answers the control requests Jarvis sends and plays a scripted turn for each
 prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow, very slow,
-delegate: /manager's coordinator starting two threads through the window's MCP server).
+delegate: /manager's coordinator starting two threads through the window's MCP server; split:
+starting a manager thread, which delegates).
 
 Every line it receives is appended to $FAKE_CLAUDE_LOG, so tests can check what was sent.
 """
@@ -255,6 +256,13 @@ def turn(prompt, message_uuid=None):
         if not stream_text(mid, 0, " ".join(["word"] * 60), delay=delay):
             result("", subtype="error_during_execution", is_error=True)
             return
+    elif "split" in p and "manager" in state.get("sdk_tools", {}):  # a manager thread, which delegates
+        args = {"title": "Backend", "prompt": "delegate the work", "manager": True}
+        tool_use(mid, "toolu_split", "mcp__manager__start_thread", args)
+        if ask("mcp__manager__start_thread", args, "toolu_split").get("behavior") == "allow":
+            reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 20)
+            tool_result("toolu_split", reply["result"]["content"])
+        stream_text(mid, 1, "The backend's manager is on it.")
     elif "delegate" in p and "manager" in state.get("sdk_tools", {}):
         for n, (title, task) in enumerate((("Say hello", "hello"), ("Edit the notes", "edit the notes"))):
             tool_id, args = f"toolu_start{n}", {"title": title, "prompt": task}

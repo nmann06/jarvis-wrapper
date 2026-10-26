@@ -1146,6 +1146,131 @@ async def test_manager_hands_the_work_to_threads(home):
         assert app.prompt.has_focus
 
 
+def mcp_replies(home):
+    """What the window's manager server answered, in order."""
+    out = [((m.get("response") or {}).get("response") or {}).get("mcp_response") for m in sent(home)]
+    return [r for r in out if r and "result" in r]
+
+
+async def test_a_manager_thread_runs_threads_of_its_own(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager split the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 3)
+        boss, one, two = app.manager.threads
+        assert (boss.title, boss.is_manager, boss.depth) == ("Backend", True, 1)
+        assert (one.parent, two.parent, one.depth) == (boss, boss, 2)
+        assert not one.is_manager and not one.can_manage
+        # The manager thread has the tools, minus making managers: its threads are as deep as it goes.
+        listed = [r["result"]["tools"] for r in mcp_replies(home) if isinstance(r["result"].get("tools"), list)]
+        assert "manager" in listed[0][0]["inputSchema"]["properties"]
+        assert "manager" not in listed[1][0]["inputSchema"]["properties"]
+        # Its threads are listed beneath it, indented.
+        rows = app.manager_pane.list.render().renderables
+        assert rows[0].plain.startswith("  ") and "1. Backend ⧉" in rows[0].plain
+        assert "    ○ 2. Say hello" in rows[2].plain or "    ✔ 2. Say hello" in rows[2].plain
+        # Thread 2's news goes to its manager, not the coordinator; the manager's goes up.
+        await until(pilot, lambda: one.look == "done" and two.look == "attention" and not boss.busy
+                    and not app.busy and replies(app).count("Noted.") >= 2)
+        assert "Noted." in thread_replies(boss)
+        boss_notices = [text_of(e.renderable) for e in boss.view.transcript.children
+                        if isinstance(e, NoticeEntry) and not isinstance(e.renderable, Widget)]
+        assert any("Thread 2 · Say hello · finished" in n for n in boss_notices)
+        coordinator_notices = [text_of(e.renderable) for e in entries(app, NoticeEntry)
+                               if not isinstance(e.renderable, Widget)]
+        assert any("Thread 1 · Backend" in n for n in coordinator_notices)
+        assert not any("Thread 2 · Say hello" in n for n in coordinator_notices)
+        updates = [m["message"]["content"] for m in sent(home) if (m.get("message") or {}).get("role") == "user"
+                   and str(m["message"].get("content", "")).startswith("<thread-update")]
+        assert any("Its own threads " in u and "are still working" in u for u in updates)
+        # The coordinator can't message a manager's thread directly.
+        reply = await app.manager.call("message_thread", {"thread": 2, "message": "hi"})
+        assert reply[1] and "thread 1's" in reply[0]
+        # It saves and comes back with the tree.
+        saved = sessions.load_manager(app.session_id)
+        assert [(t["number"], t["parent"], t["manager"]) for t in saved] == [(1, None, True), (2, 1, False),
+                                                                            (3, 1, False)]
+
+
+async def test_manager_typed_in_a_thread_and_the_thread_limit(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager-thread-limit 3")
+        assert app.thread_limit == 3 and app_module.thread_limit() == 3
+        await send(pilot, "/manager delegate the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2
+                    and app.manager.threads[0].look == "done" and not app.busy)
+        one = app.manager.threads[0]
+        assert not one.is_manager
+        session = one.session
+        await pilot.press("right", "enter")
+        assert app.manager_pane.opened is one
+        one.view.entry.value = "/manager delegate the work"
+        await pilot.press("enter")
+        # Thread 1 starts again as a manager and hands out its task, up to the limit of 3 working.
+        await until(pilot, lambda: one.is_manager and len(app.manager.threads) == 3 and not one.busy)
+        assert one.engine.sdk_mcp_servers == ["manager"]
+        argv = [m["argv"] for m in sent(home) if "argv" in m][-2]
+        assert argv[argv.index("--resume") + 1] == session  # the same conversation, now with the tools
+        assert app.manager.threads[2].parent is one
+        started = [r["result"]["content"][0]["text"] for r in mcp_replies(home) if "content" in r["result"]]
+        assert any("the most at once" in t for t in started)
+        # A manager's thread can't become one.
+        await pilot.press("left")
+        await until(pilot, lambda: app.manager_pane.opened is None)
+        three = app.manager.threads[2]
+        app.manager_pane.open(three)
+        three.view.entry.value = "/manager"
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert not three.is_manager and three.engine.sdk_mcp_servers == []
+        app.manager_pane.back_to_list(focus=False)
+        app.prompt.focus()
+        await send(pilot, "/manager-thread-limit default")
+        assert app.thread_limit == 8 and app_module.load_setting("manager_thread_limit", "gone") is None
+
+
+async def test_the_manager_picks_and_switches_model_and_effort(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager delegate the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2
+                    and app.manager.threads[0].look == "done" and app.manager.threads[1].look == "attention")
+        one, two = app.manager.threads
+
+        def argv_of(session=None):
+            runs = [m["argv"] for m in sent(home) if "argv" in m]
+            return [a for a in runs if session is None or session in a][-1]
+
+        # Chosen when it starts.
+        text, failed = await app.manager.call("start_thread", {"title": "Look it up", "prompt": "hello",
+                                                               "model": "haiku", "effort": "low"})
+        assert not failed and "on haiku, low effort" in text
+        three = app.manager.threads[2]
+        await until(pilot, lambda: three.look == "done")
+        argv = argv_of()
+        assert argv[argv.index("--model") + 1] == "haiku" and argv[argv.index("--effort") + 1] == "low"
+        assert "[haiku, low effort]" in three.describe()
+        # Switched between turns: the same conversation again, on the new ones.
+        session = one.session
+        text, failed = await app.manager.call("message_thread", {"thread": 1, "message": "think",
+                                                                 "model": "opus", "effort": "high"})
+        assert not failed and "now on opus, high effort" in text
+        argv = argv_of(session)
+        assert argv[argv.index("--resume") + 1] == session
+        assert argv[argv.index("--model") + 1] == "opus" and argv[argv.index("--effort") + 1] == "high"
+        await until(pilot, lambda: "It is **391**, sir." in thread_replies(one) and one.look == "done")
+        assert sessions.load_manager(app.session_id)[0]["effort"] == "high"
+        # Not in the middle of a turn, and only real levels.
+        text, failed = await app.manager.call("message_thread", {"thread": 2, "message": "go on", "effort": "max"})
+        assert failed and "once it finishes" in text and two.effort is None
+        text, failed = await app.manager.call("message_thread", {"thread": 1, "message": "hi", "effort": "huge"})
+        assert failed and "isn't an effort level" in text
+
+
 async def test_messaging_a_thread_and_manager_off(home):
     app = make(home)
     async with app.run_test(size=(140, 40)) as pilot:
