@@ -8,9 +8,10 @@ import re
 from textual.app import App
 from textual.widget import Widget
 
-from jarvis_code import app as app_module, panels, widgets
+from jarvis_code import app as app_module, jarvis_settings, panels, widgets
 
-INTENDED = {"display", "render", "compose", "theme", "text"}  # set or overridden on purpose
+# Set or overridden on purpose (open_url: links in replies open, or are copied over ssh).
+INTENDED = {"display", "render", "compose", "theme", "text", "open_url"}
 
 
 def our_names(cls):
@@ -25,7 +26,7 @@ def our_names(cls):
 
 
 def test_no_widget_shadows_textual():
-    for module in (widgets, panels):
+    for module in (widgets, panels, jarvis_settings):
         for _, cls in inspect.getmembers(module, inspect.isclass):
             if issubclass(cls, Widget) and cls.__module__ == module.__name__:
                 base = next(k for k in cls.__mro__ if not k.__module__.startswith("jarvis_code"))

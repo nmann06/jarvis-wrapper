@@ -34,6 +34,7 @@ from textual.widgets import Markdown, Static
 
 from . import __version__, config_items, files, persona, sessions, stats, theme, tools
 from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment
+from .jarvis_settings import JarvisSettingsPage, JarvisSettingsPanel
 from .manager import MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager, ManagerPane, update_notice
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
@@ -88,6 +89,7 @@ LOCAL_COMMANDS = {
     "export": "Save this conversation to a text file",
     "claude": "Open this conversation in regular Claude Code; exit it to come back",
     "btw": "Ask a quick side question without interrupting or adding to the conversation",
+    "jarvis": "Jarvis's own settings (/jarvis settings): voice, Claude, alarms, do not disturb…",
     "manager": "Project manager mode: Jarvis hands the work to worker Jarvises (/manager off to stop)",
     "manager-thread-limit": f"How many /manager threads work at once, at every level (default {THREAD_LIMIT})",
     "finished": "Mark this conversation as finished in the list of conversations (/finished off to undo)",
@@ -1789,6 +1791,8 @@ class JarvisApp(App):
             await self.cmd_claude()
         elif name == "btw":
             self.cmd_btw(args)
+        elif name == "jarvis":
+            await self.cmd_jarvis(args)
         elif name == "manager":
             await self.cmd_manager(args)
         elif name == "manager-thread-limit":
@@ -1824,6 +1828,24 @@ class JarvisApp(App):
             await self.engine.send(text)
         except EngineError as e:
             await self.note(str(e), theme.ERROR)
+
+    async def cmd_jarvis(self, args):
+        """/jarvis settings: the voice assistant's own settings, on a page of their own."""
+        if args.lower() not in ("", "settings", "setting", "config"):
+            self.footer.flash("Usage: /jarvis settings", 3)
+            return
+        self.menu.hide()
+        panel = JarvisSettingsPanel()
+        self.dialog, self.dialog_request = panel, None
+        page = JarvisSettingsPage(panel)
+        await self.push_screen(page)
+        try:
+            await panel.result
+        finally:
+            self.dialog = None
+            if self.screen_stack and self.screen is page:  # not if the window is closing
+                await self.pop_screen()
+                self.prompt.focus()
 
     def cmd_btw(self, question):
         if not question:
@@ -2469,7 +2491,7 @@ class JarvisApp(App):
             self.last_escape = now
 
     def action_cycle_mode(self):
-        if isinstance(self.dialog, SettingsPanel):
+        if isinstance(self.dialog, (SettingsPanel, JarvisSettingsPanel)):
             self.dialog.press("shift+tab", None)
             self.dialog.redraw()
             return
@@ -2593,6 +2615,10 @@ class JarvisApp(App):
     def action_page(self, direction):
         if isinstance(self.dialog, Picker):
             self.dialog.dialog_key("pageup" if direction < 0 else "pagedown")
+            self.dialog.redraw()
+            return
+        if isinstance(self.dialog, JarvisSettingsPanel):
+            self.dialog.press("pageup" if direction < 0 else "pagedown", None)
             self.dialog.redraw()
             return
         opened = self.manager_pane.opened
