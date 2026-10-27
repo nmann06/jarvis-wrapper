@@ -52,6 +52,17 @@ def clean_environment():
     return {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
 
 
+def usage_limit(msg):
+    """An assistant message that is Claude Code saying the plan's usage limit stopped the turn:
+    its rate_limit_info (resetsAt, when it says), or None if it isn't one. Claude Code doesn't
+    always send a rate_limit_event for it, but it always sends this."""
+    if msg.get("api_error") != "usage_limit_reached" and not (
+            msg.get("error") == "rate_limit" and msg.get("is_api_error_message")):
+        return None
+    info = (msg.get("api_error_params") or {}).get("rate_limit_info")
+    return info if isinstance(info, dict) else {}
+
+
 class Engine:
     """One `claude -p` process: start it, talk to it, stop it.
 

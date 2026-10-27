@@ -33,9 +33,10 @@ from textual.theme import Theme
 from textual.widgets import Markdown, Static
 
 from . import __version__, config_items, files, persona, sessions, stats, theme, tools
-from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment
+from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment, usage_limit
 from .jarvis_settings import JarvisSettingsPage, JarvisSettingsPanel
-from .manager import MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager, ManagerPane, update_notice
+from .manager import (KEEP_GOING_PROMPT, KEEP_GOING_TRIES, MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager,
+                      ManagerPane, update_notice)
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
                       Picker, PromptBar, PromptInput, QueuedPanel, SearchBar, SideAnswer, Spinner,
@@ -47,10 +48,6 @@ HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
 USAGE_REFRESH = 60   # seconds between asking for the plan's usage, so it keeps up with other windows
 SETTINGS = os.path.expanduser("~/.claude/jarvis-window.json")  # the window's own settings (/keepitgoin)
 
-# /keepitgoin: a turn cut off by the usage limit carries on by itself once the limit resets,
-# at most this many times in a row (a limit that's still there when it says it reset).
-KEEP_GOING_PROMPT = "The usage limit has reset. Carry on with what you were doing."
-KEEP_GOING_TRIES = 3
 MAX_THREAD_LIMIT = 50  # /manager-thread-limit at most: each thread is a Claude Code of its own
 
 # Headless Claude Code doesn't title conversations, so the window asks for one (for the tab
@@ -859,6 +856,11 @@ class JarvisApp(App):
                         agent.add_child(block.get("id"), block.get("name"), block.get("input"))
                         self.agent_of[block.get("id")] = agent
             return
+        info = usage_limit(msg)
+        if info is not None and self.busy and not self.limit_note and not msg.get("_history"):
+            # The limit cut this turn off without a rate_limit_event: /keepitgoin still carries on.
+            self.on_rate_limit({"rate_limit_info": {**info, "status": "rejected",
+                                                    "resetsAt": info.get("resetsAt") or self.session_ends}})
         if message.get("model") == "<synthetic>":
             text = user_text(content).strip()
             if text and not msg.get("_history"):

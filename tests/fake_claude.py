@@ -2,7 +2,7 @@
 anything: it answers the control requests Jarvis sends and plays a scripted turn for each
 prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow, very slow,
 delegate: /manager's coordinator starting two threads through the window's MCP server; split:
-starting a manager thread, which delegates).
+starting a manager thread, which delegates; limited: starting a thread that hits the usage limit).
 
 Every line it receives is appended to $FAKE_CLAUDE_LOG, so tests can check what was sent.
 """
@@ -243,6 +243,15 @@ def turn(prompt, message_uuid=None):
         out = "\n".join(f"file{i}.txt" for i in range(12))
         tool_result("toolu_bash", out, {"stdout": out, "stderr": ""})
         stream_text(mid, 1, "Twelve files.")
+    elif "hit the quiet limit" in p:  # the usage limit with no rate_limit_event, as Claude Code often does
+        emit({"type": "assistant", "parent_tool_use_id": None, "error": "rate_limit",
+              "is_api_error_message": True, "api_error": "usage_limit_reached",
+              "api_error_params": {"rate_limit_info": {"status": "rejected", "resetsAt": int(time.time()) + 2,
+                                                       "rateLimitType": "five_hour"}},
+              "message": {"id": mid, "model": "<synthetic>", "role": "assistant",
+                          "content": [{"type": "text", "text": "You've hit your session limit"}]}})
+        result("You've hit your session limit", is_error=True)
+        return
     elif "hit the limit" in p:  # the plan's usage limit, resetting in a moment
         emit({"type": "rate_limit_event", "rate_limit_info": {
             "status": "rejected", "resetsAt": int(time.time()) + 1, "rateLimitType": "five_hour"}})
@@ -263,6 +272,13 @@ def turn(prompt, message_uuid=None):
             reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 20)
             tool_result("toolu_split", reply["result"]["content"])
         stream_text(mid, 1, "The backend's manager is on it.")
+    elif "limited" in p and "manager" in state.get("sdk_tools", {}):
+        args = {"title": "Scan", "prompt": "hit the quiet limit"}
+        tool_use(mid, "toolu_limited", "mcp__manager__start_thread", args)
+        if ask("mcp__manager__start_thread", args, "toolu_limited").get("behavior") == "allow":
+            reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 30)
+            tool_result("toolu_limited", reply["result"]["content"])
+        stream_text(mid, 1, "A thread is on it.")
     elif "delegate" in p and "manager" in state.get("sdk_tools", {}):
         for n, (title, task) in enumerate((("Say hello", "hello"), ("Edit the notes", "edit the notes"))):
             tool_id, args = f"toolu_start{n}", {"title": title, "prompt": task}

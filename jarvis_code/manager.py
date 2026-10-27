@@ -24,6 +24,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 
 from rich.console import Group
 from rich.text import Text
@@ -33,11 +34,17 @@ from textual.widget import Widget
 from textual.widgets import Input, Static
 
 from . import persona, sessions, theme, tools
-from .engine import Engine, EngineError
+from .engine import Engine, EngineError, usage_limit
+from .panels import strftime
 from .widgets import (AssistantEntry, DoneEntry, NoticeEntry, Spinner, ThinkingEntry, ToolEntry,
                       Transcript, UserEntry, elapsed, notice)
 
 SERVER = "manager"   # the MCP server's name: its tools are mcp__manager__*
+# /keepitgoin: a turn cut off by the usage limit carries on by itself once the limit resets,
+# at most this many times in a row (a limit that's still there when it says it reset). The
+# window's own turns and its threads' turns alike.
+KEEP_GOING_PROMPT = "The usage limit has reset. Carry on with what you were doing."
+KEEP_GOING_TRIES = 3
 THREAD_LIMIT = 8     # threads working at once, at every level (/manager-thread-limit changes it)
 MAX_DEPTH = 2        # the coordinator's threads are 1 down; a manager thread's are 2, and can't manage
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]  # as app.EFFORT_LEVELS
@@ -180,6 +187,11 @@ def attribute(value):
     return " ".join(str(value).split()).replace('"', "'")
 
 
+def clock(when):
+    """An epoch time as the footer shows it: "9:00 pm"."""
+    return strftime(datetime.fromtimestamp(when), "%-I:%M %p").lower() if when else "?"
+
+
 class Thread:
     """One worker Jarvis: its Claude Code, what it has done, and its view in the pane."""
 
@@ -188,7 +200,7 @@ class Thread:
         self.number, self.title, self.model, self.effort = number, title, model, effort
         self.parent = parent      # the manager thread that started it (None: the coordinator)
         self.is_manager = is_manager  # it has the tools to start threads of its own
-        self.status = "starting"  # starting, working, done, error, stopped (theme.THREAD_LOOK)
+        self.status = "starting"  # starting, working, paused, done, error, stopped (theme.THREAD_LOOK)
         self.activity = ""        # what it's doing now: "Thinking", "Bash(npm test)"
         self.turn_started = time.monotonic()
         self.ended = None
@@ -200,6 +212,9 @@ class Thread:
         self.for_coordinator = False  # its manager (coordinator or parent thread) asked for this turn
         self.restarting = False   # its Claude Code is starting again: as a manager, or on another model
         self.interrupting = False
+        self.limit = None         # its turn hit the usage limit: rate_limit_info (resetsAt, if it said)
+        self.resumes = None       # paused: when it carries on (epoch seconds), /keepitgoin
+        self.kept_going = 0       # times in a row it has carried on after the limit
         self.tools = {}           # tool_use_id -> ToolEntry, as in the window (app.py)
         self.agent_of = {}
         self.permissions = asyncio.Queue()
@@ -435,6 +450,42 @@ class Thread:
             self.for_coordinator = False
             self.manager.report(self, text)
 
+    def pause(self, limit):
+        """Its turn hit the usage limit: with /keepitgoin on, it waits for the limit to reset and
+        carries on by itself (False: it doesn't, and the turn ends as failed)."""
+        resets = limit.get("resetsAt") or self.app.session_ends  # the 5-hour window's, if it didn't say
+        if not (self.app.keep_going and isinstance(resets, (int, float)) and resets > time.time()):
+            return False
+        if self.kept_going >= KEEP_GOING_TRIES:
+            return False
+        coordinator, self.for_coordinator = self.for_coordinator, False
+        self.status, self.resumes = "paused", resets
+        self.app.set_timer(resets - time.time() + 1, lambda: self.app.run_worker(
+            self.carry_on(resets, coordinator), group=f"thread-{self.number}"))
+        return True
+
+    async def carry_on(self, resets, for_coordinator):
+        """The limit that paused it has reset: on with its task, as if its manager had asked
+        (when its manager had), so the manager hears how it went."""
+        if self.status != "paused" or self.resumes != resets or self.closing or self.manager.closed:
+            return  # messaged in the meantime, or gone
+        self.resumes = None
+        if not self.app.keep_going:  # /keepitgoin turned off while it waited
+            self.status, self.for_coordinator = "error", False
+            text = "The usage limit has reset, but /keepitgoin is off, so it's waiting to be messaged."
+            await self.add(NoticeEntry(notice(text), attached=False))
+            self.changed()
+            self.manager.save()
+            if for_coordinator:
+                self.manager.report(self, f"{self.reply}\n\n{text}".strip())
+            return
+        self.kept_going += 1
+        try:
+            await self.send(KEEP_GOING_PROMPT, from_coordinator=for_coordinator)
+        except EngineError as e:
+            self.for_coordinator = for_coordinator
+            await self.fail(f"Couldn't carry on after the usage limit: {e}")
+
     async def add(self, widget):
         if self.batch is not None:
             self.batch.append(widget)
@@ -457,6 +508,10 @@ class Thread:
                 self.on_system(msg)
             elif kind == "result":
                 await self.on_result(msg)
+            elif kind == "rate_limit_event":
+                info = msg.get("rate_limit_info") or {}
+                if info.get("status") == "rejected" and self.busy:
+                    self.limit = {**(self.limit or {}), **info}
             elif kind == "control_cancel_request":
                 self.cancelled.add(msg.get("request_id"))
                 if self.dialog is not None and self.dialog_request == msg.get("request_id"):
@@ -493,6 +548,9 @@ class Thread:
                         agent.add_child(block.get("id"), block.get("name"), block.get("input"))
                         self.agent_of[block.get("id")] = agent
             return
+        info = usage_limit(msg)
+        if info is not None and self.busy:
+            self.limit = {**(self.limit or {}), **info}
         for block in content:
             kind = block.get("type")
             if kind == "text" and block.get("text", "").strip():
@@ -567,9 +625,18 @@ class Thread:
         self.view.spinner.stop()
         self.ended, self.activity = time.monotonic(), ""
         self.reply = msg.get("result") if isinstance(msg.get("result"), str) else ""
+        limit, self.limit = self.limit, None
         if self.interrupting:
             self.status = "stopped"
             await self.add(NoticeEntry(tools.interrupted()))
+        elif limit is not None and self.pause(limit):
+            await self.add(NoticeEntry(notice(f"Usage limit reached · carries on by itself at "
+                                              f"{clock(self.resumes)} (/keepitgoin)"), attached=False))
+            self.interrupting = False
+            self.session = msg.get("session_id") or self.session
+            self.changed()
+            self.manager.save()
+            return  # its manager hears when it has carried on and finished
         elif msg.get("is_error"):
             self.status = "error"
             errors = [e for e in (msg.get("errors") or []) if isinstance(e, str)]
@@ -577,7 +644,7 @@ class Thread:
             self.reply = self.reply or text
             await self.add(NoticeEntry(notice(str(text), theme.ERROR)))
         else:
-            self.status = "done"
+            self.status, self.kept_going = "done", 0
             if took >= 8 and msg.get("num_turns"):
                 await self.add(DoneEntry(took))
         self.interrupting = False
@@ -634,7 +701,8 @@ class Thread:
     def describe(self):
         word = theme.THREAD_LOOK[self.look][2]
         since = elapsed((self.ended or time.monotonic()) - self.turn_started)
-        about = self.activity if self.status == "working" else ""
+        about = self.activity if self.status == "working" else \
+            f"usage limit: carries on by itself at {clock(self.resumes)}" if self.status == "paused" else ""
         line = f"{self.number}. {self.title}: {word} ({since})" + (f", {about}" if about else "")
         if self.setup():
             line += f" [{self.setup()}]"
@@ -1029,7 +1097,7 @@ class ManagerPane(Vertical):
         for thread in self.threads:
             counts[thread.look] = counts.get(thread.look, 0) + 1
         title = Text("Threads", style=f"bold {theme.ACCENT}")
-        for status in ("attention", "working", "done", "error", "stopped"):
+        for status in ("attention", "working", "paused", "done", "error", "stopped"):
             if counts.get(status):
                 glyph, colour, word = theme.THREAD_LOOK[status]
                 title.append(f"  {glyph} {counts[status]} {word}", style=colour)

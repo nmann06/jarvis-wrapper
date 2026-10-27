@@ -54,6 +54,7 @@ THREAD_LOOK = {
     # status: (glyph, colour, word)
     "starting": ("○", DIM, "starting"),
     "working": ("●", ACCENT, "working"),
+    "paused": ("◔", LABEL, "paused"),
     "attention": ("◆", ATTENTION, "needs you"),
     "done": ("✔", SUCCESS, "finished"),
     "error": ("✘", ERROR, "failed"),

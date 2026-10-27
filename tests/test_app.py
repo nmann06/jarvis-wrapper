@@ -928,6 +928,57 @@ async def test_keepitgoin_carries_on_when_the_usage_limit_resets(home):
     assert make(home).keep_going  # saved: a new window reads it
 
 
+async def test_keepitgoin_without_a_rate_limit_event(home):
+    """Claude Code often says the limit stopped a turn only in the turn's own message."""
+    prompts = lambda: [m["message"]["content"] for m in sent(home) if m.get("type") == "user"]
+    app = make(home)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "hit the quiet limit")
+        await until(pilot, lambda: not app.busy and "keeps going then" in app.footer.right)
+        await until(pilot, lambda: app_module.KEEP_GOING_PROMPT in prompts())
+
+
+def thread_updates(home):
+    """The <thread-update>s the window sent its coordinator, in order."""
+    return [m["message"]["content"] for m in sent(home)
+            if m.get("type") == "user" and str(m["message"]["content"]).startswith("<thread-update")]
+
+
+async def test_keepitgoin_carries_a_thread_on_after_the_usage_limit(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager limited")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 1)
+        scan = app.manager.threads[0]
+        await until(pilot, lambda: scan.look == "paused")
+        assert "carries on by itself at" in scan.describe()
+        assert "◔ 1 paused" in app.manager_pane.title_view.render().plain
+        # The limit resets: it carries on as its manager's task, and the manager hears once it's done.
+        await until(pilot, lambda: scan.look == "done")
+        assert thread_replies(scan)[-1] == "Hello, sir. How may I help?"
+        assert scan.kept_going == 0
+        await until(pilot, lambda: len(thread_updates(home)) == 1)
+        assert 'status="done"' in thread_updates(home)[0]
+
+
+async def test_a_thread_waits_after_the_usage_limit_with_keepitgoin_off(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/keepitgoin off")
+        await until(pilot, lambda: not app.keep_going)
+        await send(pilot, "/manager limited")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 1)
+        scan = app.manager.threads[0]
+        await until(pilot, lambda: scan.look == "error")
+        await until(pilot, lambda: len(thread_updates(home)) == 1)
+        assert 'status="error"' in thread_updates(home)[0]
+        await pilot.pause(3.5)  # past the reset: it doesn't carry on by itself
+        assert scan.look == "error" and len(thread_updates(home)) == 1
+
+
 async def test_ctrl_x_ctrl_s_sends_the_queued_prompt_now(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
