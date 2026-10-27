@@ -138,7 +138,10 @@ async def test_question_typed_answer(home):
         await until(pilot, lambda: app.dialog is not None)
         await pilot.press("3")
         await until(pilot, lambda: app.dialog.entry.has_focus)
-        await pilot.press(*"Water", "enter")
+        await pilot.press(*"Water")
+        await pilot.pause()
+        assert app.dialog.entry.content_size.height == 1  # what's typed shows, not just a focus border
+        await pilot.press("enter")
         await until(pilot, lambda: "You chose Water." in replies(app))
 
 

@@ -730,7 +730,9 @@ class HRule(Static):
 class PromptInput(TextArea):
     """The prompt. Enter sends (queued while Jarvis is busy; ctrl+x s, handled by the app,
     sends now);
-    \\+Enter, ctrl+j or alt+enter start a new line; the arrows walk
+    shift+enter, \\+Enter, ctrl+j or alt+enter start a new line (shift+enter only where the terminal
+    sends it apart from Enter: Windows Terminal needs a sendInput "\\n" key, see docs/terminal.md
+    in ~/jarvis); the arrows walk
     the suggestion menu when it's open and the prompt history from the first or last row on screen."""
 
     DEFAULT_CSS = f"""
@@ -991,7 +993,7 @@ class Dialog(Vertical):
     Dialog > .body {{ height: auto; max-height: 45vh; margin: 1 0 0 1; }}
     Dialog > .question {{ height: auto; margin-top: 1; }}
     Dialog > .choices {{ height: auto; }}
-    Dialog > Input {{ margin: 0 0 0 3; border: none; height: 1; padding: 0; background: transparent; }}
+    Dialog > Input {{ margin: 0 0 0 3; height: 1; padding: 0; background: transparent; }}
     Dialog > .hint {{ height: auto; color: {theme.DIM}; margin-top: 1; }}
     Picker > Input {{ margin: 1 0; padding: 0 1; height: 1; background: {theme.USER_BG}; }}
     """
@@ -1012,7 +1014,7 @@ class Dialog(Vertical):
         self.colour = colour
         self.result = asyncio.get_running_loop().create_future()
         self.choice_view = Static(classes="choices")
-        self.entry = Input(placeholder="Type your answer, then Enter")
+        self.entry = Input(placeholder="Type your answer, then Enter", compact=True)
         self.entry.display = False
 
     def compose(self):
