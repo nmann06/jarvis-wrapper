@@ -159,6 +159,7 @@ class Panel(Vertical):
 class SettingsPanel(Panel):
     """Claude Code's Settings panel: Status, Config, Usage and Stats."""
 
+    STATS_VIEWS = ["overview", "models", "cost"]
     TABS = [("status", "Status"), ("config", "Config"), ("usage", "Usage"), ("stats", "Stats")]
 
     def __init__(self, tab="usage"):
@@ -220,13 +221,13 @@ class SettingsPanel(Panel):
             return self.config_key(key, char)
         if key in ("left", "shift+tab"):
             if self.tab == "stats" and not self.in_tabs:
-                self.stats_view = "overview"
+                self.stats_view = self.STATS_VIEWS[max(self.STATS_VIEWS.index(self.stats_view) - 1, 0)]
             else:
                 self.switch(-1)
             return True
         if key in ("right", "tab"):
             if self.tab == "stats" and not self.in_tabs and key == "right":
-                self.stats_view = "models"
+                self.stats_view = self.STATS_VIEWS[min(self.STATS_VIEWS.index(self.stats_view) + 1, len(self.STATS_VIEWS) - 1)]
             else:
                 self.switch(1)
             return True
@@ -311,7 +312,7 @@ class SettingsPanel(Panel):
         if self.tab == "stats":
             if self.in_tabs:
                 return prefix + f"{tabs} · ↓ for stats · Esc to close"
-            return prefix + "←/→ Overview/Models · r to cycle dates · ctrl+s to copy · ↑ to tabs · Esc to close"
+            return prefix + "←/→ Overview/Models/Cost · r to cycle dates · ctrl+s to copy · ↑ to tabs · Esc to close"
         if self.tab == "config":
             return prefix + f"{tabs} · ↓ to settings · Esc to close"
         return prefix + f"{tabs} · Esc to close"
@@ -558,6 +559,14 @@ class SettingsPanel(Panel):
                     grid.add_row(Text(name), Text(f"{entry.get('pct', 0)}%"))
                 rows += [Text(""), grid]
             rows.append(Text(""))
+        costs = data.get("api_cost")
+        if costs:
+            names = {"1d": "today", "7d": "7 days", "30d": "30 days"}
+            line = "API equivalent: " + " · ".join(f"{names[key]} {money(costs[key]['total'])}"
+                                                   for key, _, _ in stats_mod.COST_RANGES)
+            if any(c["unpriced"] for c in costs.values()):
+                line += " (not counting unpriced models)"
+            rows += [Text(line), Text("")]
         spend = (data.get("rate_limits") or {}).get("spend") or {}
         if spend:
             rows.append(section("Usage credits"))
@@ -596,11 +605,11 @@ class SettingsPanel(Panel):
 
     def draw_stats(self, data):
         views = Text()
-        for key, label in (("overview", "Overview"), ("models", "Models")):
+        for key, label in (("overview", "Overview"), ("models", "Models"), ("cost", "API cost")):
             views.append(f" {label} ", style=f"bold black on {theme.ACCENT}" if key == self.stats_view
                          else theme.LABEL)
             views.append("  ")
-        body = self.stats_overview(data) if self.stats_view == "overview" else self.stats_models(data)
+        body = getattr(self, f"stats_{self.stats_view}")(data)
         return Group(views, Text(""), *body)
 
     def stats_overview(self, data):
@@ -701,6 +710,30 @@ class SettingsPanel(Panel):
         rows.append(grid)
         return rows
 
+    def stats_cost(self, data):
+        """What the last day, 7 days and 30 days would have cost at API prices, in total and by model."""
+        costs = stats_mod.api_costs(data)
+        rows = [section("What this would cost at API prices"),
+                dim("Your tokens at pay-as-you-go rates, not what your plan charges"), Text("")]
+        for key, label, _ in stats_mod.COST_RANGES:
+            cost = costs[key]
+            rows.append(Text.assemble((f"{label}: ", theme.LABEL), (money(cost["total"]), f"bold {theme.ACCENT}")))
+            for model, m in sorted(cost["models"].items(), key=lambda kv: kv[1]["cost"], reverse=True):
+                line = Text.assemble(("  ● ", theme.DIM), (self.model_name(model), "bold"),
+                                     (f"  {money(m['cost'])}", theme.ACCENT),
+                                     (f"  {stats_mod.human_tokens(m['tokens'])} tokens", theme.DIM))
+                if m["estimated"]:
+                    line.append(f" ({stats_mod.human_tokens(m['estimated'])} estimated)", style=theme.DIM)
+                rows.append(line)
+            for model, n in cost["unpriced"].items():
+                rows.append(Text.assemble(("  ● ", theme.DIM), (self.model_name(model), "bold"),
+                                          ("  unpriced", theme.WARNING),
+                                          (f"  {stats_mod.human_tokens(n)} tokens, not in the total", theme.DIM)))
+            rows.append(Text(""))
+        rows.append(dim("Estimated: days Claude Code only kept a total for are priced at the model's overall mix "
+                        "of input, output and cache tokens."))
+        return rows
+
     def stats_text(self, data):
         s = stats_mod.summary(data, self.stats_range)
         label = dict((k, l) for k, l, _ in stats_mod.RANGES)[self.stats_range]
@@ -714,6 +747,10 @@ class SettingsPanel(Panel):
             f"Longest streak: {plural_days(s['longest_streak'])}",
             f"Current streak: {plural_days(s['current_streak'])}",
         ])
+
+
+def money(amount):
+    return f"${amount:,.2f}"
 
 
 def plural_days(n):

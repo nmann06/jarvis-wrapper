@@ -227,9 +227,30 @@ async def test_ctrl_x_s_sends_now(home):
         assert app.prompt.text == "hello"  # not cut
         await pilot.press("s")
         await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy, timeout=15)
-        assert any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+        assert not any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))  # no "what instead?"
         assert [e.text for e in entries(app, UserEntry)] == ["slow", "hello"]
         assert not app.queued and app.prompt.text == ""
+
+
+async def test_ctrl_x_s_marks_a_call_it_cuts_off_without_asking_what_to_do(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "long command")
+        await until(pilot, lambda: app.busy and entries(app, ToolEntry))
+        app.prompt.set_text("hello")
+        await pilot.press("ctrl+x", "s")
+        await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy, timeout=15)
+        call = entries(app, ToolEntry)[0]
+        assert call.state == "interrupted" and text_of(call.result_view.content).strip() == "⎿  Interrupted"
+        assert not any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+        # Esc is a plain interrupt: it still asks.
+        await send(pilot, "long command")
+        await until(pilot, lambda: app.busy and len(entries(app, ToolEntry)) == 2)
+        await pilot.press("escape")
+        await until(pilot, lambda: not app.busy)
+        notices = [text_of(n.renderable) for n in entries(app, NoticeEntry)]
+        assert any("Interrupted · What should Jarvis do instead?" in n for n in notices)
 
 
 async def test_ctrl_x_then_another_key_types_it(home):
@@ -335,15 +356,81 @@ async def test_bash_command_folds_to_one_line_and_click_unfolds_it(home):
         assert not tool.header_view.has_class("oneline")  # the whole command while it runs
         await pilot.press("enter")
         await until(pilot, lambda: not app.busy and replies(app))
-        assert tool.header_view.has_class("oneline")  # one line once it's done
-        assert "+8 lines" in text_of(tool.result_view.content) and not tool.collapse_button.display
-        await pilot.click(tool.header_view)
-        assert "+8 lines" not in text_of(tool.result_view.content) and tool.collapse_button.display
+        assert tool.header_view.has_class("oneline")  # one line once it's done, and no output under it
+        assert not tool.result_view.display and not tool.collapse_button.display
+        await pilot.click(tool.header_view)  # a click shows it
+        assert "file11.txt" in text_of(tool.result_view.content) and tool.result_view.display
+        assert tool.collapse_button.display
         await pilot.click(tool.collapse_button)
-        assert "+8 lines" in text_of(tool.result_view.content) and not tool.collapse_button.display
+        assert not tool.result_view.display and not tool.collapse_button.display
         await pilot.click(tool.header_view)
         await pilot.press("ctrl+o")  # ctrl+o takes over from the click
         assert not tool.collapse_button.display
+
+
+async def test_tool_calls_in_a_row_fold_into_one_line(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "run several commands")
+        await until(pilot, lambda: not app.busy and "That's the lot." in replies(app))
+        status, pytest_q, read, ls, wc = entries(app, ToolEntry)
+        # git status, pytest and the Read share the Read's line, the thoughts the latest one's.
+        assert [t.display for t in (status, pytest_q, read, ls, wc)] == [False, False, True, False, True]
+        first, second = entries(app, ThinkingEntry)
+        assert (first.display, second.display) == (False, True) and second.also == [first]
+        assert text_of(second.view.content).startswith("Thought for")
+        line = read.header_view.content
+        assert line.plain.startswith("Read(") and line.plain.endswith("(+2 more · 1 failed)")
+        # After the words, a run of its own, right under them (no second gap).
+        assert wc.header_view.content.plain == "Bash(wc -l notes.txt)  (+1 more)"
+        assert wc.has_class("after-reply") and not ls.has_class("after-reply")
+        assert any(span.style == f"italic {theme.DIM}" for span in wc.header_view.content.spans)  # grey italic
+        # A click shows the whole run, ▲ collapse folds it again.
+        await pilot.click(read.header_view)
+        assert all(t.display for t in (status, pytest_q, read, first, second)) and read.collapse_button.display
+        assert "more" not in read.header_view.content.plain
+        assert pytest_q.state == "error" and pytest_q.glyph_view.content.style == theme.ERROR  # failed, in red,
+        assert not pytest_q.result_view.display and not status.result_view.display  # without its output
+        await pilot.pause()  # the run's calls laid out, the button where it'll be clicked
+        await pilot.click(read.collapse_button)
+        assert [t.display for t in (status, pytest_q, read, first, second)] == [False, False, True, False, True]
+        assert not read.collapse_button.display
+        # A click on the thought's line opens the run too.
+        await pilot.click(second.view)
+        assert all(t.display for t in (status, pytest_q, first, second)) and not second.also
+        await pilot.click(read.collapse_button)
+        # ctrl+o shows every call and thought, and folds them again.
+        await pilot.press("ctrl+o")
+        assert all(t.display for t in (status, pytest_q, read, ls, wc, first, second))
+        assert "more" not in read.header_view.content.plain
+        assert "nothing to commit" in text_of(status.result_view.content)  # and the commands' output
+        await pilot.press("ctrl+o")
+        assert [t.display for t in (status, pytest_q, read, ls, wc)] == [False, False, True, False, True]
+        assert (first.display, second.display) == (False, True)
+        # A search finds a call or a thought out of sight and opens its run.
+        await pilot.press("ctrl+f")
+        await pilot.press(*"pytest")
+        await until(pilot, lambda: app.found == [pytest_q] and pytest_q.display)
+        await pilot.click(read.collapse_button)
+        app.search_bar.input.value = "status first"
+        await until(pilot, lambda: app.found == [first] and first.display)
+
+
+async def test_a_thread_folds_its_tool_calls_too(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager hand off commands")
+        await until(pilot, lambda: app.manager is not None and app.manager.threads
+                    and app.manager.threads[0].look == "done")
+        thread = app.manager.threads[0]
+        calls = [e for e in thread.view.transcript.children if isinstance(e, ToolEntry)]
+        assert [t.display for t in calls] == [False, False, True, False, True]
+        assert calls[2].header_view.content.plain.endswith("(+2 more · 1 failed)")
+        thoughts = [e for e in thread.view.transcript.children if isinstance(e, ThinkingEntry)]
+        assert [t.display for t in thoughts] == [False, True]  # one ∴ line, not two
+        assert not any(t.result_view.display for t in calls if t.tool_name == "Bash")  # no output under commands
 
 
 async def test_btw_answers_aside(home):
@@ -452,6 +539,31 @@ async def test_thinking_shows_once_it_is_done(home):
         assert live.display
 
 
+async def test_thoughts_one_after_another_show_as_one_line(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        first = await app.add(ThinkingEntry())
+        first.started -= 2
+        first.finish("First, the timers.")
+        second = await app.add(ThinkingEntry())
+        await pilot.pause()
+        assert first.display and not second.display  # the last one done stands until the next is
+        second.started -= 3
+        second.finish("Then the tests.")
+        await pilot.pause()
+        assert not first.display and second.display
+        assert "Thought for 5s (ctrl+o to expand)" in text_of(second.view.content)  # their time added up
+        await pilot.click(second.view)  # a click shows each, in order
+        assert first.display and "Thought for 3s" in text_of(second.view.content)
+        assert second.collapse_button.display
+        await pilot.click(second.collapse_button)
+        assert not first.display and not second.collapse_button.display
+        await app.add(AssistantEntry("Done."))
+        third = await app.add(ThinkingEntry("After the reply.", done=True))
+        assert third.display and second.display  # the reply between them: each its own line
+
+
 async def test_bash_permission_and_folded_output(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
@@ -461,8 +573,10 @@ async def test_bash_permission_and_folded_output(home):
         assert "Yes, and don't ask again for ls:* commands in this project" in text_of(app.dialog.choice_view.content)
         await pilot.press("enter")
         await until(pilot, lambda: not app.busy and replies(app))
-        out = text_of(entries(app, ToolEntry)[0].result_view.content)
-        assert "file3.txt" in out and "… +8 lines (ctrl+o to expand)" in out
+        tool = entries(app, ToolEntry)[0]
+        assert not tool.result_view.display  # the command alone, in grey
+        await pilot.press("ctrl+o")  # ctrl+o shows its output
+        assert tool.result_view.display and "file11.txt" in text_of(tool.result_view.content)
 
 
 async def test_clear_starts_fresh(home):
@@ -474,6 +588,63 @@ async def test_clear_starts_fresh(home):
         await send(pilot, "/clear")
         await until(pilot, lambda: not replies(app) and not app.busy)
         assert any("new conversation" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+
+
+async def test_clear_empties_the_threads_and_stays_in_manager_mode(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager delegate the work")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 2
+                    and app.manager.threads[0].look == "done" and app.manager.threads[1].look == "attention")
+        await until(pilot, lambda: not app.busy)
+        old, threads = app.session_id, list(app.manager.threads)
+        engines = [t.engine for t in threads]
+        await send(pilot, "/clear")
+        await until(pilot, lambda: app.session_id != old and not app.busy)
+        assert app.manager is not None and app.manager_pane.display  # still in manager mode
+        assert app.manager.threads == [] and app.manager_pane.threads == []
+        assert not any(t.view.is_attached for t in threads)
+        assert not any(e.running for e in engines)  # the one still at work was stopped
+        assert [t["title"] for t in sessions.load_manager(old)] == ["Say hello", "Edit the notes"]
+        assert sessions.load_manager(app.session_id) == [] and not app.updates
+        # The new conversation's threads are numbered from 1 again, and the old ones stay quiet.
+        await send(pilot, "delegate the work")
+        await until(pilot, lambda: len(app.manager.threads) == 2 and app.manager.threads[0].look == "done")
+        assert [t.number for t in app.manager.threads] == [1, 2]
+        await until(pilot, lambda: not app.busy)
+        assert replies(app).count("Noted.") == 1
+        # /resume brings the old conversation back with its own threads.
+        new = app.session_id
+        save_session(home, home, old, "delegate the work")
+        await send(pilot, f"/resume {old}")
+        await until(pilot, lambda: app.session_id == old and app.manager is not None
+                    and [t.title for t in app.manager.threads] == ["Say hello", "Edit the notes"])
+        assert [t["title"] for t in sessions.load_manager(new)] == ["Say hello", "Edit the notes"]
+
+
+async def test_mute_flags_the_window_for_the_hook(home, monkeypatch):
+    monkeypatch.setattr(app_module, "MUTED", str(home / "muted"))
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        flag = home / "muted" / app.window_id
+        await send(pilot, "/manager hand off commands")  # a thread's Claude Code too
+        await until(pilot, lambda: app.manager is not None and app.manager.threads
+                    and app.manager.threads[0].engine is not None)
+        windows = [m["window"] for m in sent(home) if "argv" in m]
+        assert len(windows) >= 3 and set(windows) == {app.window_id}  # the main one, again as coordinator, the thread
+        await send(pilot, "/mute")
+        await until(pilot, lambda: flag.exists())
+        assert "muted" in app.footer.right
+        assert any("Muted: Jarvis won't say when this window finishes" in text_of(n.renderable)
+                   for n in entries(app, NoticeEntry) if not isinstance(n.renderable, Widget))
+        await send(pilot, "/mute")
+        await until(pilot, lambda: not flag.exists())
+        assert "muted" not in app.footer.right
+        await send(pilot, "/mute")
+        await until(pilot, lambda: flag.exists())
+    assert not flag.exists()  # gone with the window: the next one starts unmuted
 
 
 async def test_computer_says_where_the_window_runs(home):
@@ -994,7 +1165,7 @@ async def test_ctrl_x_ctrl_s_sends_the_queued_prompt_now(home):
         await pilot.press("ctrl+x", "ctrl+s")
         await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy)
         assert time.monotonic() - started < 3  # not after the slow one finished
-        assert any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
+        assert not any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
         assert [e.text for e in entries(app, UserEntry)] == ["slow", "hello"]
         assert not app.queued and not app.queued_panel.display
 
@@ -1092,6 +1263,7 @@ async def test_ctrl_x_s_works_whatever_has_focus(home):
         # ctrl let go and pressed again between the keys: kitty-protocol terminals report it
         await pilot.press("ctrl+x", "left_control", "ctrl+s")
         await until(pilot, lambda: "Hello, sir. How may I help?" in replies(app) and not app.busy)
+        assert not any("Interrupted" in text_of(n.renderable) for n in entries(app, NoticeEntry))
         now = [m for m in sent(home) if m.get("request", {}).get("subtype") == "interrupt"]
         assert now and now[-1]["request"].get("send_now") is True
         assert [e.text for e in entries(app, UserEntry)] == ["slow", "hello"]

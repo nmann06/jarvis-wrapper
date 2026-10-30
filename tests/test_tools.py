@@ -34,10 +34,30 @@ def test_edit_result_is_a_numbered_diff():
 
 def test_long_output_is_folded_until_ctrl_o():
     out = "\n".join(f"line {i}" for i in range(10))
-    folded = plain(tools.result("Bash", {"command": "seq"}, out, {"stdout": out, "stderr": ""}, False, "/"))
+    folded = plain(tools.result("mcp__jarvis__seq", {}, out, None, False, "/"))
     assert "line 3" in folded and "line 4" not in folded and "… +6 lines (ctrl+o to expand)" in folded
-    full = plain(tools.result("Bash", {"command": "seq"}, out, {"stdout": out, "stderr": ""}, False, "/", verbose=True))
+    full = plain(tools.result("mcp__jarvis__seq", {}, out, None, False, "/", verbose=True))
     assert "line 9" in full
+
+
+def test_bash_shows_its_output_only_with_ctrl_o():
+    out = "\n".join(f"line {i}" for i in range(10))
+    data = {"stdout": out, "stderr": "warning"}
+    assert tools.result("Bash", {"command": "seq"}, out, data, False, "/") is None
+    full = plain(tools.result("Bash", {"command": "seq"}, out, data, False, "/", verbose=True))
+    assert "line 9" in full and "warning" in full
+    failed = "Exit code 1\n1 failed"
+    assert tools.result("Bash", {"command": "pytest"}, failed, "Error: Exit code 1", True, "/") is None
+    assert "1 failed" in plain(tools.result("Bash", {"command": "pytest"}, failed, "Error: Exit code 1", True, "/",
+                                            verbose=True))
+    assert tools.result("Bash", {"command": "true"}, "", {"stdout": "", "stderr": ""}, False, "/") is None
+    assert "(No output)" in plain(tools.result("Bash", {"command": "true"}, "", {"stdout": ""}, False, "/", verbose=True))
+    # What isn't output still shows: a command sent to the background, or cut off.
+    background = {"stdout": "", "backgroundTaskId": "b7"}
+    assert plain(tools.result("Bash", {"command": "npm run dev"}, "", background, False, "/")).strip() == \
+        "⎿  Running in the background (b7)"
+    stopped = {"stdout": "partial", "interrupted": True}
+    assert plain(tools.result("Bash", {"command": "sleep 9"}, "partial", stopped, False, "/")).strip() == "⎿  Interrupted"
 
 
 def test_errors_and_rejections():

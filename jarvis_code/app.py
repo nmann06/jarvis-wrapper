@@ -32,7 +32,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import Markdown, Static
 
-from . import __version__, config_items, files, persona, sessions, stats, theme, tools
+from . import __version__, config_items, files, persona, runs, sessions, stats, theme, tools
 from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment, usage_limit
 from .jarvis_settings import JarvisSettingsPage, JarvisSettingsPanel
 from .manager import (KEEP_GOING_PROMPT, KEEP_GOING_TRIES, MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager,
@@ -47,6 +47,9 @@ CHORD_TIME = 2       # seconds after ctrl+x in which s sends now
 HISTORY_LIMIT = 300  # saved records redrawn on resume; older ones are left out
 USAGE_REFRESH = 60   # seconds between asking for the plan's usage, so it keeps up with other windows
 SETTINGS = os.path.expanduser("~/.claude/jarvis-window.json")  # the window's own settings (/keepitgoin)
+# /mute's flags, one per window: the Claude Code hook (jarvis deploy/claude-hook.py) checks for
+# its window's before saying "I'm finished".
+MUTED = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "jarvis-claude", "muted")
 
 MAX_THREAD_LIMIT = 50  # /manager-thread-limit at most: each thread is a Claude Code of its own
 
@@ -91,6 +94,7 @@ LOCAL_COMMANDS = {
     "manager-thread-limit": f"How many /manager threads work at once, at every level (default {THREAD_LIMIT})",
     "finished": "Mark this conversation as finished in the list of conversations (/finished off to undo)",
     "keepitgoin": "Carry on by itself when a usage limit resets (/keepitgoin on|off; no args toggles)",
+    "mute": "Jarvis stops saying when this window finishes (/mute again to unmute)",
     "computer": "Show which computer this window is running on",
     "fuck": "Stop Jarvis right now, like esc",
     "exit": "Exit Jarvis",
@@ -287,6 +291,12 @@ def tag(text, name):
     return match.group(1) if match else None
 
 
+def folded(entry):
+    """Whether an entry is out of sight in its folded run (a tool call or a thought)."""
+    run = getattr(entry, "run", None)
+    return run is not None and run.hides(entry)
+
+
 def preview_patch(path, old, new, replace_all=False):
     """The hunks an edit would make, for the permission dialog (Claude Code shows the diff)."""
     try:
@@ -457,7 +467,7 @@ class JarvisApp(App):
         self.model_override = options.model
         self.effort_override = options.effort or load_setting("default_effort", None)  # /default-usage
         self.busy = False
-        self.interrupting = False
+        self.interrupting = False  # True, or "now": stopped by ctrl+x s for the next prompt
         self.turn_started = 0.0
         self.tokens_done = self.tokens_current = 0
         self.verbose = False
@@ -465,6 +475,7 @@ class JarvisApp(App):
         self.tasks = {}      # TaskCreate id -> {"content", "status", "activeForm"}
         self.todos = []      # TodoWrite's list
         self.tools = {}      # tool_use_id -> ToolEntry
+        self.runs = runs.Runs()  # tool calls one after another, folded to one line
         self.agent_of = {}   # a subagent's tool_use_id -> its agent's ToolEntry
         self.blocks = {}     # (message id, block index) -> entry being streamed
         self.waiting = {}    # message id -> streamed entries waiting for their final text
@@ -493,6 +504,8 @@ class JarvisApp(App):
         self.keep_going = load_setting("keep_going", True)  # /keepitgoin
         self.stalled = None               # a turn hit the usage limit: when it resets (epoch seconds)
         self.kept_going = 0               # times in a row /keepitgoin has carried on
+        self.window_id = uuid.uuid4().hex[:12]  # JARVIS_WINDOW for its Claude Codes, which /mute goes by
+        self.muted = False                # /mute: unmuted again in the next window
         self.session_ends = None          # when the 5-hour usage window resets (epoch seconds)
         self.usage = {}                   # % of the plan used: {"five_hour": 13, "seven_day": 28}
         self.tab_title = None             # the terminal tab's title: what the conversation is about
@@ -598,6 +611,7 @@ class JarvisApp(App):
                         thinking_display=self.options.thinking_display,
                         sdk_mcp_servers=[SERVER] if self.manager is not None else (),
                         on_mcp=self.manager.handle_mcp if self.manager is not None else None,
+                        env={"JARVIS_WINDOW": self.window_id},
                         command=self.options.engine_command, log_path=self.options.log_path)
         engine.on_message = lambda msg: self.on_engine_message(engine, msg)
         engine.on_permission = lambda rid, req: self.permission_queue.put_nowait((engine, rid, req))
@@ -734,7 +748,7 @@ class JarvisApp(App):
             limit = self.limit_note
             if limit and self.stalled and self.keep_going:
                 limit += " · keeps going then"
-            parts = (limit, session,
+            parts = ("muted" if self.muted else "", limit, session,
                      f"weekly {self.usage['seven_day']}%" if "seven_day" in self.usage else "",
                      f"{running} background task{'s' if running != 1 else ''}" if running else "",
                      self.model_label(), self.effort and f"{self.effort} effort",
@@ -1051,7 +1065,8 @@ class JarvisApp(App):
             for entry in self.tools.values():
                 if entry.state == "running":
                     entry.mark("interrupted")
-            await self.add(NoticeEntry(tools.interrupted()))
+            if self.interrupting != "now":  # not when stopped for the prompt sent now
+                await self.add(NoticeEntry(tools.interrupted()))
         elif msg.get("is_error"):
             errors = [e for e in (msg.get("errors") or []) if isinstance(e, str)]
             text = "; ".join(errors) or msg.get("result") or msg.get("subtype", "error").replace("_", " ")
@@ -1132,9 +1147,36 @@ class JarvisApp(App):
         else:
             await self.note("Keep it goin' is off: after a usage limit, Jarvis waits for you.")
 
+    async def cmd_mute(self):
+        """/mute: Jarvis doesn't say "I'm finished" for this window (its threads too) until
+        /mute again, or the window closes. A flag file, so its Claude Codes go on as they are."""
+        try:
+            self.set_muted(not self.muted)
+        except OSError as e:
+            await self.note(f"Couldn't change /mute: {e}", theme.ERROR)
+            return
+        self.update_footer()
+        if self.muted:
+            await self.note("Muted: Jarvis won't say when this window finishes. /mute again to unmute.")
+        else:
+            await self.note("Unmuted: Jarvis says when this window finishes a long task again.")
+
+    def set_muted(self, muted):
+        path = os.path.join(MUTED, self.window_id)
+        if muted:
+            os.makedirs(MUTED, mode=0o700, exist_ok=True)
+            open(path, "w").close()
+        elif os.path.exists(path):
+            os.remove(path)
+        self.muted = muted
+
     async def on_reset(self, msg):
-        """/clear: a new conversation, same window."""
+        """/clear: a new conversation, same window. In manager mode the old conversation's
+        threads stop and leave the pane (saved with it, for /resume)."""
+        if self.manager is not None:
+            await self.manager.clear()
         await self.clear_transcript()
+        self.stalled, self.kept_going = None, 0  # /keepitgoin has nothing of the old one to carry on
         self.session_id = msg.get("new_conversation_id") or self.session_id
         self.set_tab_title(None)
         await self.note("Started a new conversation. The last one stays saved: /resume brings it back.")
@@ -1174,10 +1216,10 @@ class JarvisApp(App):
         self.waiting.clear()
         self.refresh_tasks()
 
-    async def interrupt(self):
+    async def interrupt(self, now=False):
         if not self.busy or not self.engine:
             return
-        self.interrupting = True
+        self.interrupting = "now" if now else True
         try:
             await self.engine.interrupt()
         except EngineError:
@@ -1189,7 +1231,7 @@ class JarvisApp(App):
         go first)."""
         if not self.busy:
             return
-        await self.interrupt()
+        await self.interrupt(now=True)
         deadline = time.monotonic() + timeout
         while self.busy and self.interrupting and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
@@ -1436,6 +1478,7 @@ class JarvisApp(App):
     async def run_hook(self, command, payload, timeout):
         env = clean_environment()
         env["CLAUDE_PROJECT_DIR"] = self.cwd
+        env["JARVIS_WINDOW"] = self.window_id
         try:
             proc = await asyncio.create_subprocess_shell(
                 command, cwd=self.cwd, env=env, stdin=asyncio.subprocess.PIPE,
@@ -1536,9 +1579,9 @@ class JarvisApp(App):
         if not self.busy or not self.engine:
             return
         if "interrupt_send_now_v1" not in self.capabilities:
-            await self.interrupt()  # an older Claude Code: it keeps the queue through an interrupt
+            await self.interrupt(now=True)  # an older Claude Code: it keeps the queue through an interrupt
             return
-        self.interrupting = True  # if the turn is stopped, its result reads as an interruption
+        self.interrupting = "now"  # if the turn is stopped, its result reads as one, without the notice
         try:
             done = await self.engine.send_now()
         except EngineError as e:
@@ -1801,6 +1844,8 @@ class JarvisApp(App):
             await self.cmd_thread_limit(args)
         elif name == "keepitgoin":
             await self.cmd_keep_going(args)
+        elif name == "mute":
+            await self.cmd_mute()
         elif name == "finished":
             await self.cmd_finished(args)
         elif name == "computer":
@@ -2300,6 +2345,10 @@ class JarvisApp(App):
             data["cost_text"] = (await engine.request("get_session_cost", timeout=15)).get("text")
         except EngineError:
             pass
+        try:
+            data["api_cost"] = stats.api_costs(await self.panel_stats())
+        except Exception:
+            pass  # the stats are a nicety on this page
         return data
 
     async def panel_config(self):
@@ -2425,8 +2474,7 @@ class JarvisApp(App):
             out, err = b"", b"Timed out after 10 minutes"
         out, err = out.decode(errors="replace"), err.decode(errors="replace")
         data = {"stdout": out, "stderr": err}
-        await self.add(NoticeEntry(draw=lambda verbose: tools.result("Bash", {"command": command}, out, data, False,
-                                                                     self.cwd, verbose), verbose=self.verbose))
+        await self.add(NoticeEntry(draw=lambda verbose: tools.shell_output(out, data, verbose), verbose=self.verbose))
         self.pending_context.append(f"<bash-input>{command}</bash-input>\n<bash-stdout>{out[-30000:]}</bash-stdout>"
                                     f"<bash-stderr>{err[-5000:]}</bash-stderr>")
 
@@ -2574,7 +2622,8 @@ class JarvisApp(App):
         query = text.strip().lower()
         self.show_found(None)
         self.found = [e for e in self.transcript.children
-                      if query and isinstance(e, Entry) and e.display and query in e.plain().lower()]
+                      if query and isinstance(e, Entry) and (e.display or folded(e))
+                      and query in e.plain().lower()]
         if self.found:
             self.show_found(len(self.found) - 1)
         self.search_bar.set_count("" if not query else "No matches" if not self.found else self.found_count())
@@ -2589,7 +2638,11 @@ class JarvisApp(App):
         if index is not None:
             entry = self.found[index]
             entry.add_class("found")
-            self.transcript.scroll_to_widget(entry, top=True, animate=False)
+            if not entry.display and folded(entry):  # folded into its run's line
+                entry.run.open()
+                self.call_after_refresh(self.transcript.scroll_to_widget, entry, top=True, animate=False)
+            else:
+                self.transcript.scroll_to_widget(entry, top=True, animate=False)
 
     def on_search_bar_changed(self, event):
         self.search(event.text)
@@ -2652,6 +2705,11 @@ class JarvisApp(App):
         self.exit(self.session_id)
 
     async def on_unmount(self):
+        if self.muted:  # the next window starts unmuted
+            try:
+                self.set_muted(False)
+            except OSError:
+                pass
         if self.manager is not None:  # the window closed some other way
             await asyncio.gather(*(t.close() for t in self.manager.threads), return_exceptions=True)
         if self.engine is not None:
@@ -2668,6 +2726,7 @@ class JarvisApp(App):
         previous = shown[-1] if shown else None
         if isinstance(previous, AssistantEntry):
             widget.add_class("after-reply")
+        self.runs.add(widget)
         if self.batch is not None:
             self.batch.append(widget)
         else:
@@ -2682,6 +2741,7 @@ class JarvisApp(App):
             if not isinstance(child, Banner):
                 await child.remove()
         self.tools.clear()
+        self.runs.clear()
         self.agent_of.clear()
         self.blocks.clear()
         self.waiting.clear()

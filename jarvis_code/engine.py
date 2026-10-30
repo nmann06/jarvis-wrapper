@@ -77,7 +77,7 @@ class Engine:
     def __init__(self, cwd, on_message, on_permission, *, model=None, effort=None,
                  permission_mode=None, resume=None, continue_last=False, fork=False,
                  append_system_prompt=None, thinking_display="summarized", add_dirs=(),
-                 sdk_mcp_servers=(), on_mcp=None, command=None, log_path=None):
+                 sdk_mcp_servers=(), on_mcp=None, env=None, command=None, log_path=None):
         self.cwd = cwd
         self.on_message = on_message
         self.on_permission = on_permission
@@ -88,6 +88,7 @@ class Engine:
         self.add_dirs = list(add_dirs)
         self.sdk_mcp_servers = list(sdk_mcp_servers)
         self.on_mcp = on_mcp
+        self.env = dict(env or {})  # more variables for it (JARVIS_WINDOW, for its hooks)
         self.command = command  # replaces `claude` (tests run a fake engine)
         self.log = open(log_path, "a", buffering=1) if log_path else None
         self.proc = None
@@ -123,6 +124,7 @@ class Engine:
     def environment(self):
         env = clean_environment()
         env.setdefault("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
+        env.update(self.env)
         return env
 
     async def start(self):

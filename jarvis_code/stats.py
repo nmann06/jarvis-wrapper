@@ -9,11 +9,35 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 
 RANGES = [("all", "All time", None), ("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30)]
+
+# The rolling ranges of the API-equivalent cost: what the same tokens would cost at API prices.
+COST_RANGES = [("1d", "Today", 1), ("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30)]
+
+# API prices, dollars per million tokens: (input, output, cache read, cache write 5m, cache write 1h).
+# From https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-29). Haiku 5.5 is
+# the rate for prompts up to 100K tokens; longer ones cost five times as much, which the logs
+# don't tell apart. Add a model here when it comes out; one missing is shown as unpriced.
+PRICES = {
+    ("fable", "5.1"): (10, 50, 0.25, 12.5, 20), ("mythos", "5.1"): (10, 50, 0.25, 12.5, 20),
+    ("fable", "5"): (10, 50, 1, 12.5, 20), ("mythos", "5"): (10, 50, 1, 12.5, 20),
+    ("opus", "5.5"): (4, 20, 0.2, 5, 8),
+    ("opus", "5"): (5, 25, 0.5, 6.25, 10), ("opus", "4.8"): (5, 25, 0.5, 6.25, 10),
+    ("opus", "4.7"): (5, 25, 0.5, 6.25, 10), ("opus", "4.6"): (5, 25, 0.5, 6.25, 10),
+    ("opus", "4.5"): (5, 25, 0.5, 6.25, 10),
+    ("opus", "4.1"): (15, 75, 1.5, 18.75, 30), ("opus", "4"): (15, 75, 1.5, 18.75, 30),
+    ("sonnet", "5.5"): (2, 10, 0.1, 2.5, 4), ("sonnet", "5"): (2, 10, 0.2, 2.5, 4),
+    ("sonnet", "4.6"): (3, 15, 0.3, 3.75, 6), ("sonnet", "4.5"): (3, 15, 0.3, 3.75, 6),
+    ("sonnet", "4"): (3, 15, 0.3, 3.75, 6),
+    ("haiku", "5.5"): (0.1, 0.5, 0.01, 0.125, 0.2), ("haiku", "4.5"): (1, 5, 0.1, 1.25, 2),
+}
+FAMILY = re.compile(r"(fable|mythos|opus|sonnet|haiku)-(\d{1,2})(?:-(\d{1,2}))?(?!\d)")
+TOKEN_KINDS = ("input", "output", "cache_read", "cache_write", "cache_write_1h")  # the last is part of cache_write
 
 
 @dataclass
@@ -22,6 +46,7 @@ class Day:
     sessions: int = 0
     tools: int = 0
     tokens: dict = field(default_factory=dict)  # model -> tokens
+    usage: dict = field(default_factory=dict)   # model -> {TOKEN_KINDS: tokens}; only the last 30 days
 
 
 @dataclass
@@ -73,6 +98,7 @@ def load(claude_dir=None, today=None):
         pass
     new_sessions, new_longest, new_first = _scan(os.path.join(claude_dir, "projects"), computed, days, models)
     first = min(d for d in (first, new_first) if d) if (first or new_first) else None
+    _scan_usage(os.path.join(claude_dir, "projects"), today - dt.timedelta(days=COST_RANGES[-1][2] - 1), days)
     return Stats(days, models, sessions + new_sessions, max(longest, new_longest), first, today)
 
 
@@ -118,9 +144,8 @@ def _scan(projects, after, days, models):
                 if not usage or not model or model == "<synthetic>" or mid in seen:
                     continue
                 seen.add(mid)  # every block of a reply repeats the same usage
-                parts = {"input": usage.get("input_tokens") or 0, "output": usage.get("output_tokens") or 0,
-                         "cache_read": usage.get("cache_read_input_tokens") or 0,
-                         "cache_write": usage.get("cache_creation_input_tokens") or 0}
+                parts = _parts(usage)
+                del parts["cache_write_1h"]
                 day.tokens[model] = day.tokens.get(model, 0) + sum(parts.values())
                 totals = models.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
                 for k, v in parts.items():
@@ -130,6 +155,100 @@ def _scan(projects, after, days, models):
     longest = max((int((high - low) * 1000) for low, high in spans.values()), default=0)
     first = min((dt.date.fromtimestamp(low) for low, _ in spans.values()), default=None)
     return len(spans), longest, first
+
+
+def _parts(usage):
+    """One reply's tokens by kind; the cache writes split by lifetime when the log says."""
+    write = usage.get("cache_creation_input_tokens") or 0
+    long = (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
+    return {"input": usage.get("input_tokens") or 0, "output": usage.get("output_tokens") or 0,
+            "cache_read": usage.get("cache_read_input_tokens") or 0,
+            "cache_write": write, "cache_write_1h": min(long, write)}
+
+
+def _scan_usage(projects, since, days):
+    """Fill Day.usage (tokens by model and kind) from the saved conversations, from `since` on.
+    The cache only keeps one total a day a model, which can't be priced."""
+    start = dt.datetime.combine(since, dt.time()).timestamp()
+    seen = set()
+    for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < start:
+                continue
+            f = open(path, errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                if '"usage"' not in line or '"assistant"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                message = record.get("message") or {}
+                date = _date(record.get("timestamp") or "")
+                usage, model, mid = message.get("usage"), message.get("model"), message.get("id")
+                if (record.get("type") != "assistant" or date is None or date < since or not usage
+                        or not model or model == "<synthetic>" or mid in seen):
+                    continue
+                seen.add(mid)
+                totals = days.setdefault(date.isoformat(), Day()).usage.setdefault(model, dict.fromkeys(TOKEN_KINDS, 0))
+                for k, v in _parts(usage).items():
+                    totals[k] += v
+
+
+def price_of(model):
+    """The PRICES row for a model id of any date or suffix (claude-opus-4-5-20251101, ...[1m]), or None."""
+    found = FAMILY.search((model or "").lower())
+    if not found:
+        return None
+    family, major, minor = found.groups()
+    return PRICES.get((family, f"{major}.{minor}" if minor else major))
+
+
+def cost_of(price, tokens):
+    long = tokens["cache_write_1h"]
+    return (tokens["input"] * price[0] + tokens["output"] * price[1] + tokens["cache_read"] * price[2]
+            + (tokens["cache_write"] - long) * price[3] + long * price[4]) / 1e6
+
+
+def api_cost(stats, span):
+    """What the last `span` days would have cost at API prices: {"total", "models": {model: {"cost",
+    "tokens", "estimated"}}, "unpriced": {model: tokens}}. A day whose cache total is bigger than
+    the conversations still hold (they get cleaned up) has the rest priced at that model's overall
+    mix of token kinds, and counted in "estimated"."""
+    since = stats.today - dt.timedelta(days=span - 1)
+    models, unpriced = {}, {}
+    for key, day in stats.days.items():
+        if dt.date.fromisoformat(key) < since:
+            continue
+        for model in set(day.tokens) | set(day.usage):
+            known = dict.fromkeys(TOKEN_KINDS, 0)
+            known.update(day.usage.get(model, {}))
+            counted = sum(v for k, v in known.items() if k != "cache_write_1h")
+            gap = max(day.tokens.get(model, 0) - counted, 0)
+            mix = stats.models.get(model) or {}
+            guess = dict.fromkeys(TOKEN_KINDS, 0)
+            if gap and sum(mix.values()):
+                for k in ("input", "output", "cache_read", "cache_write"):
+                    guess[k] = gap * mix[k] / sum(mix.values())
+            else:
+                gap = 0  # nothing to go on for these
+            price = price_of(model)
+            if price is None:
+                unpriced[model] = unpriced.get(model, 0) + counted + gap
+                continue
+            entry = models.setdefault(model, {"cost": 0.0, "tokens": 0, "estimated": 0})
+            entry["cost"] += cost_of(price, known) + cost_of(price, guess)
+            entry["tokens"] += counted + gap
+            entry["estimated"] += gap
+    return {"total": sum(m["cost"] for m in models.values()), "models": models, "unpriced": unpriced}
+
+
+def api_costs(stats):
+    """api_cost() for each of COST_RANGES: {"1d": ..., "7d": ..., "30d": ...}."""
+    return {key: api_cost(stats, span) for key, _, span in COST_RANGES}
 
 
 def summary(stats, range_key="all"):

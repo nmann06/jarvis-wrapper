@@ -316,17 +316,15 @@ def result(name, tool_input, content, data, is_error, cwd, verbose=False):
         message = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
         if "doesn't want to proceed" in message or "rejected" in message.lower():
             return block([Text("User rejected this action", style=theme.ERROR)])
+        if name == "Bash" and not verbose and "<tool_use_error>" not in text:
+            return None  # a command that failed: its red bullet says so, ctrl+o shows the output
         return block(plain_lines(message or "Error", verbose, style=theme.ERROR))
 
-    if name == "Bash":
-        out = d.get("stdout", text) if d else text
-        err = d.get("stderr", "") if d else ""
-        rows = plain_lines(out, verbose) + plain_lines(err, verbose, style=theme.ERROR)
-        if d.get("interrupted"):
-            rows.append(Text("Interrupted", style=theme.ERROR))
-        if d.get("backgroundTaskId"):
-            rows.append(Text(f"Running in the background ({d['backgroundTaskId']})", style=theme.DIM))
-        return block(rows or [Text("(No output)", style=theme.DIM)])
+    if name == "Bash":  # the command alone; its output only with ctrl+o
+        if verbose:
+            return shell_output(text, d, verbose)
+        lines = status_lines(d)
+        return block(lines) if lines else None
 
     if name == "Read":
         f = d.get("file") or {}
@@ -408,6 +406,26 @@ def result(name, tool_input, content, data, is_error, cwd, verbose=False):
     return block(plain_lines(text, verbose) or [Text("(No output)", style=theme.DIM)])
 
 
+def shell_output(text, data, verbose):
+    """A command's output, folded to a few lines until ctrl+o: a ! command's, or a Bash call's
+    with ctrl+o."""
+    d = data if isinstance(data, dict) else {}
+    out = d.get("stdout", text) if d else text
+    err = d.get("stderr", "") if d else ""
+    rows = plain_lines(out, verbose) + plain_lines(err, verbose, style=theme.ERROR)
+    return block(rows + status_lines(d) or [Text("(No output)", style=theme.DIM)])
+
+
+def status_lines(data):
+    """What a command's result says besides its output: cut off, or sent to the background."""
+    lines = []
+    if data.get("interrupted"):
+        lines.append(Text("Interrupted", style=theme.ERROR))
+    if data.get("backgroundTaskId"):
+        lines.append(Text(f"Running in the background ({data['backgroundTaskId']})", style=theme.DIM))
+    return lines
+
+
 def rejected():
     return block([Text("User rejected this action", style=theme.ERROR)])
 
@@ -416,5 +434,10 @@ def interrupted():
     return block([Text("Interrupted · What should Jarvis do instead?", style=theme.ERROR)])
 
 
+def cut_off():
+    """Under a tool call an interruption stopped; the question is the notice's after the turn."""
+    return block([Text("Interrupted", style=theme.ERROR)])
+
+
 __all__ = ["title", "header", "result", "block", "DiffView", "todo_rows", "short_path",
-           "content_text", "rejected", "interrupted", "Group"]
+           "content_text", "shell_output", "rejected", "interrupted", "cut_off", "Group"]

@@ -6,6 +6,7 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -106,6 +107,7 @@ async def test_usage_tab(home):
                       "Start fresh when you switch tasks · run /clear", "/plugin-authoring",
                       "claude.ai Jarvis", "f to fix 1 of 2", "Usage credits are off"):
             assert words in text, words
+        assert re.search(r"API equivalent: today \$\d[\d,.]* · 7 days \$\d[\d,.]* · 30 days \$\d[\d,.]*", text)
         assert panel.tab == "usage" and "▶" not in text
         await pilot.press("w")
         assert "Last 7d · 2007 requests" in shown(app) and "/claude-api" in shown(app)
@@ -184,6 +186,13 @@ async def test_stats_tab(home):
         await pilot.press("right")
         assert panel.stats_view == "models" and "Tokens per Day" in shown(app)
         assert "Haiku 5.5" in shown(app)
+        await pilot.press("right")
+        text = shown(app)
+        assert panel.stats_view == "cost" and "What this would cost at API prices" in text
+        for words in ("Today: $", "Last 7 days: $", "Last 30 days: $", "Opus 5.5", "estimated"):
+            assert words in text, words
+        await pilot.press("left")
+        assert panel.stats_view == "models"
 
 
 async def test_mcp_menu(home):

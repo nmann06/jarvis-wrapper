@@ -17,7 +17,7 @@ from textual.screen import Screen
 from textual.widget import Widget
 from textual.widgets import Input, Markdown, Static, TextArea
 
-from . import theme, tools
+from . import runs, theme, tools
 
 
 def elapsed(seconds):
@@ -213,7 +213,10 @@ class AssistantEntry(Entry):
 
 
 class ThinkingEntry(Entry):
-    """∴ Thought for 3s, folded to one line; ctrl+o (or a click) shows what was thought."""
+    """∴ Thought for 3s, folded to one line; ctrl+o (or a click) shows what was thought.
+    Thoughts in a row (with tool calls between) fold into the latest one's line (runs.py)."""
+
+    run_role = "think"
 
     def __init__(self, text="", verbose=False, done=False):
         self.text = text
@@ -222,6 +225,9 @@ class ThinkingEntry(Entry):
         self.done = done  # a thought from a saved conversation: how long it took isn't known
         self.expanded = verbose
         self.opened = False  # clicked open, with ctrl+o off
+        self.run = None      # the run it's in (runs.py)
+        self.folded = False  # out of sight, the run's latest thought standing for it
+        self.also = []       # the thoughts this one's line stands for
         self.view = Static()
         self.collapse_button = CollapseButton()
         super().__init__("∴", f"italic {theme.ACCENT}", Vertical(self.view, self.collapse_button))
@@ -232,6 +238,10 @@ class ThinkingEntry(Entry):
         """While it thinks the spinner says so; the entry turns up once it's done (or as it
         goes, with ctrl+o)."""
         return self.done or self.expanded
+
+    @property
+    def verbose(self):
+        return self.expanded
 
     def on_mount(self):
         self.redraw()
@@ -248,31 +258,43 @@ class ThinkingEntry(Entry):
             self.duration = time.monotonic() - self.started
             self.done = True
         self.redraw()
+        if self.run is not None:
+            self.run.changed()  # it stands for the run's other thoughts now
 
     def set_verbose(self, verbose):
         self.expanded = verbose
         self.opened = False
+        if self.run is not None:
+            self.run.opened = False
+            self.run.changed()
         self.redraw()
 
     def on_click(self):
-        if not self.expanded and not self.opened and self.text.strip():
+        if self.also:
+            self.run.open()
+        elif not self.expanded and not self.opened and self.text.strip():
             self.opened = True
             self.redraw()
 
     def collapse(self):
         self.opened = False
+        if self.run is not None and self is self.run.closer() and self.run.opened:
+            self.run.close()
         self.redraw()
 
     def redraw(self):
-        self.display = self.shown
-        self.collapse_button.display = self.opened and bool(self.text.strip())
+        self.display = self.shown and not self.folded
+        closes_run = self.run is not None and self is self.run.closer() and self.run.opened and not self.expanded
+        self.collapse_button.display = self.opened and bool(self.text.strip()) or closes_run
+        thoughts = self.also + [self]
         if not self.done:
             label = Text("Thinking…", style=f"italic {theme.ACCENT}")
-        elif self.duration is None:
+        elif any(t.duration is None for t in thoughts):
             label = Text("Thought", style=f"italic {theme.ACCENT}")
         else:
-            label = Text(f"Thought for {max(1, round(self.duration))}s", style=f"italic {theme.ACCENT}")
-        if not self.text.strip():
+            took = sum(t.duration for t in thoughts)
+            label = Text(f"Thought for {max(1, round(took))}s", style=f"italic {theme.ACCENT}")
+        if not self.text.strip() and not self.also:
             self.view.update(label)
         elif self.expanded or self.opened:
             self.view.update(Group(label, Text(self.text.strip(), style=f"italic {theme.DIM}")))
@@ -284,7 +306,8 @@ class ThinkingEntry(Entry):
 
 
 class ToolEntry(Entry):
-    """● Tool(args) with its result under a ⎿; agents list their own tool calls as they go."""
+    """● Tool(args) with its result under a ⎿; agents list their own tool calls as they go.
+    Calls one after another fold into the latest one's line (runs.py)."""
 
     DEFAULT_CSS = """
     ToolEntry > .body > .progress { height: auto; }
@@ -302,6 +325,7 @@ class ToolEntry(Entry):
         self.waiting = False  # for the permission dialog
         self.input_complete = bool(tool_input)
         self.opened = False  # clicked open, with ctrl+o off
+        self.run = None  # the run of calls it's in (runs.py), if any
         self.header_view = Static()
         self.progress_view = Static(classes="progress")
         self.result_view = Static(classes="result")
@@ -312,6 +336,14 @@ class ToolEntry(Entry):
     def on_mount(self):
         self.redraw()
 
+    @property
+    def run_role(self):
+        return runs.role(self.tool_name, self.has_class("quiet"))
+
+    def run_changed(self):
+        if self.run is not None:
+            self.run.changed(self)
+
     def set_input(self, tool_input):
         self.input = tool_input or {}
         self.input_complete = True
@@ -321,10 +353,12 @@ class ToolEntry(Entry):
         self.result_args = (content, data, is_error)
         self.state = "error" if is_error else "done"
         self.redraw()
+        self.run_changed()
 
     def mark(self, state):
         self.state = state
         self.redraw()
+        self.run_changed()
 
     def add_child(self, tool_id, name, tool_input):
         self.children_calls.append([tool_id, name, tool_input or {}, "running"])
@@ -343,15 +377,22 @@ class ToolEntry(Entry):
     def set_verbose(self, verbose):
         self.verbose = verbose
         self.opened = False
+        if self.run is not None and self is self.run.last:  # the run's members have theirs by now
+            self.run.opened = False
+            self.run_changed()
         self.redraw()
 
     def on_click(self):
-        if not self.verbose and not self.opened and self.expandable():
+        if self.run is not None and self.run.is_folded_line(self):
+            self.run.open()
+        elif not self.verbose and not self.opened and self.expandable():
             self.opened = True
             self.redraw()
 
     def collapse(self):
         self.opened = False
+        if self.run is not None and self is self.run.last and self.run.opened:
+            self.run.close()
         self.redraw()
 
     def expandable(self):
@@ -373,6 +414,7 @@ class ToolEntry(Entry):
     def set_waiting(self, waiting):
         self.waiting = waiting
         self.redraw()
+        self.run_changed()
 
     def blink(self, on):
         if self.state == "running":
@@ -388,6 +430,10 @@ class ToolEntry(Entry):
         header = tools.header(self.tool_name, self.input, self.cwd, pending=not self.input_complete, full=full)
         if self.tool_name == "Bash" and full == tools.RUNNING_COMMAND:
             header = self._first_rows(header, full)
+        header.stylize(f"italic {theme.DIM}")
+        note = self.run.note() if self.run is not None and self is self.run.last else None
+        if note:
+            header = self._with_note(header, runs.note_text(note), one_row=self.tool_name == "Bash" and not full)
         self.header_view.update(header)
         progress = self._progress(expanded)
         self.progress_view.update(progress)
@@ -395,11 +441,22 @@ class ToolEntry(Entry):
         result = self._result(expanded)
         self.result_view.update(result)
         self.result_view.display = bool(result)
-        self.collapse_button.display = self.opened
+        self.collapse_button.display = self.opened or (self.run is not None and self is self.run.last
+                                                       and self.run.opened and not self.verbose)
 
     def on_resize(self):
-        if self.tool_name == "Bash" and self.state == "running":
-            self.redraw()  # the running command's rows are cut to the width
+        if self.tool_name == "Bash" and (self.state == "running" or self.run is not None and self is self.run.last):
+            self.redraw()  # the running command's rows, or the line a run's count goes on, are cut to the width
+
+    def _with_note(self, header, note, one_row):
+        """The header with a folded run's count after it; a one-row header is cut to make room."""
+        if one_row:
+            width = self.header_view.size.width or max(20, self.app.size.width - 4)
+            room = width - note.cell_len
+            if header.cell_len > room:
+                header.truncate(max(1, room - 1))
+                header.append("…", style=f"italic {theme.DIM}")
+        return header + note
 
     def _first_rows(self, text, rows):
         """The header as wrapped on screen, cut to rows with an ellipsis."""
@@ -433,7 +490,7 @@ class ToolEntry(Entry):
         if self.state == "rejected":
             return tools.rejected()
         if self.state == "interrupted":
-            return tools.interrupted()
+            return tools.cut_off()
         if self.result_args is None:
             if self.state == "running" and self.tool_name == "Bash" and self.input_complete and not self.waiting:
                 return tools.block([Text("Running…", style=theme.DIM)])

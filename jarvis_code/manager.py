@@ -33,7 +33,7 @@ from textual.containers import Vertical
 from textual.widget import Widget
 from textual.widgets import Input, Static
 
-from . import persona, sessions, theme, tools
+from . import persona, runs, sessions, theme, tools
 from .engine import Engine, EngineError, usage_limit
 from .panels import strftime
 from .widgets import (AssistantEntry, DoneEntry, NoticeEntry, Spinner, ThinkingEntry, ToolEntry,
@@ -216,6 +216,7 @@ class Thread:
         self.resumes = None       # paused: when it carries on (epoch seconds), /keepitgoin
         self.kept_going = 0       # times in a row it has carried on after the limit
         self.tools = {}           # tool_use_id -> ToolEntry, as in the window (app.py)
+        self.runs = runs.Runs()   # tool calls one after another, folded to one line
         self.agent_of = {}
         self.permissions = asyncio.Queue()
         self.cancelled = set()
@@ -282,6 +283,7 @@ class Thread:
                              sdk_mcp_servers=[SERVER] if self.is_manager else (),
                              on_mcp=(lambda server, message: self.manager.handle_mcp(server, message, self))
                              if self.is_manager else None,
+                             env={"JARVIS_WINDOW": app.window_id},
                              command=app.options.engine_command, log_path=log)
         self.mode = mode
         try:
@@ -487,6 +489,7 @@ class Thread:
             await self.fail(f"Couldn't carry on after the usage limit: {e}")
 
     async def add(self, widget):
+        self.runs.add(widget)
         if self.batch is not None:
             self.batch.append(widget)
         else:
@@ -847,6 +850,8 @@ class Manager:
 
     def report(self, thread, body):
         """Tell its manager (the coordinator, or the thread that started it) how a thread's turn ended."""
+        if thread.closing:  # stopped with the rest (/clear, /manager off): nobody's waiting to hear
+            return
         if len(body) > REPORT_LIMIT:
             body = body[:REPORT_LIMIT] + f"\n… (cut short: read_thread({thread.number}) has all of it)"
         working = [t.number for t in thread.children if t.busy]
@@ -875,9 +880,19 @@ class Manager:
         closing). What was saved of them stays, for reopening this conversation."""
         self.save()
         self.closed = True
+        await self.stop_threads()
+
+    async def clear(self):
+        """/clear: stop every thread and empty the pane, staying in manager mode for the new
+        conversation. What was saved of them stays with the old one, for /resume."""
+        self.save()
+        await self.stop_threads()
+
+    async def stop_threads(self):
         threads, self.threads = self.threads, []
         for thread in threads:
             self.app.workers.cancel_group(self.app, f"thread-{thread.number}")
+        self.app.workers.cancel_group(self.app, "thread-updates")  # news on its way to the coordinator
         await asyncio.gather(*(t.close() for t in threads), return_exceptions=True)
         await self.pane.clear()
 

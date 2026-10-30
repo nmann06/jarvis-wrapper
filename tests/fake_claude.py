@@ -1,6 +1,6 @@
 """A stand-in for `claude -p` in stream-json mode, for testing the window without spending
 anything: it answers the control requests Jarvis sends and plays a scripted turn for each
-prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow, very slow,
+prompt, picked by a keyword in it (hello, think, edit, question, plan, agent, slow, very slow, long command,
 delegate: /manager's coordinator starting two threads through the window's MCP server; split:
 starting a manager thread, which delegates; limited: starting a thread that hits the usage limit).
 
@@ -234,6 +234,36 @@ def turn(prompt, message_uuid=None):
                     {"status": "completed", "totalToolUseCount": 1, "totalTokens": 1500,
                      "totalDurationMs": 2100, "content": [{"type": "text", "text": "Two files."}]})
         stream_text(mid, 1, "There are two files.")
+    elif "several commands" in p:  # a run of tool calls, thinking between, then words, then another
+        def think(index, text):
+            emit({"type": "stream_event", "event": {"type": "content_block_start", "index": index,
+                                                    "content_block": {"type": "thinking", "thinking": ""}}})
+            emit(assistant(mid, [{"type": "thinking", "thinking": text}]))
+            emit({"type": "stream_event", "event": {"type": "content_block_stop", "index": index}})
+
+        think(0, "Status first.")
+        tool_use(mid, "toolu_run1", "Bash", {"command": "git status"})
+        tool_result("toolu_run1", "nothing to commit", {"stdout": "nothing to commit", "stderr": ""})
+        tool_use(mid, "toolu_run2", "Bash", {"command": "pytest -q"}, index=2)
+        tool_result("toolu_run2", "Exit code 1\n1 failed", "Error: Exit code 1", is_error=True)
+        think(3, "Look at the notes.")
+        path = os.path.join(os.getcwd(), "notes.txt")
+        tool_use(mid, "toolu_run3", "Read", {"file_path": path}, index=4)
+        tool_result("toolu_run3", "1\talpha", {"type": "text", "file": {"filePath": path, "content": "alpha\n",
+                                                                       "numLines": 1, "startLine": 1, "totalLines": 1}})
+        stream_text(mid, 5, "One test fails.")
+        tool_use(mid, "toolu_run4", "Bash", {"command": "ls"}, index=6)
+        tool_result("toolu_run4", "notes.txt", {"stdout": "notes.txt", "stderr": ""})
+        tool_use(mid, "toolu_run5", "Bash", {"command": "wc -l notes.txt"}, index=7)
+        tool_result("toolu_run5", "1 notes.txt", {"stdout": "1 notes.txt", "stderr": ""})
+        stream_text(mid, 8, "That's the lot.")
+    elif "hand off commands" in p and "manager" in state.get("sdk_tools", {}):
+        args = {"title": "Commands", "prompt": "run several commands"}
+        tool_use(mid, "toolu_handoff", "mcp__manager__start_thread", args)
+        if ask("mcp__manager__start_thread", args, "toolu_handoff").get("behavior") == "allow":
+            reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 40)
+            tool_result("toolu_handoff", reply["result"]["content"])
+        stream_text(mid, 1, "A thread is on it.")
     elif "bash" in p:
         tool_input = {"command": "ls -la", "description": "List files"}
         tool_use(mid, "toolu_bash", "Bash", tool_input)
@@ -260,6 +290,14 @@ def turn(prompt, message_uuid=None):
                           "content": [{"type": "text", "text": "You've hit your limit"}]}})
         result("You've hit your limit", is_error=True)
         return
+    elif "long command" in p:  # a command still running when the turn is stopped
+        tool_id = "toolu_long" + uuid.uuid4().hex[:6]
+        tool_use(mid, tool_id, "Bash", {"command": "sleep 30"})
+        for _ in range(200):
+            if interrupted.wait(0.05):
+                result("", subtype="error_during_execution", is_error=True)
+                return
+        tool_result(tool_id, "", {"stdout": "", "stderr": ""})
     elif "slow" in p:
         delay = 0.3 if "very slow" in p else 0.03  # very slow: about 18 seconds, for an interrupt to end
         if not stream_text(mid, 0, " ".join(["word"] * 60), delay=delay):
@@ -398,7 +436,7 @@ def waiting(prompts):
 
 
 def main():
-    log(json.dumps({"argv": sys.argv[1:]}))
+    log(json.dumps({"argv": sys.argv[1:], "window": os.environ.get("JARVIS_WINDOW")}))
     if len(sys.argv) > 2 and sys.argv[1] == "-p" and not sys.argv[2].startswith("--"):
         print_mode(sys.argv[2])
         return
