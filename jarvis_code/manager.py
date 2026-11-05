@@ -40,6 +40,7 @@ from .widgets import (AssistantEntry, DoneEntry, NoticeEntry, Spinner, ThinkingE
                       Transcript, UserEntry, elapsed, notice)
 
 SERVER = "manager"   # the MCP server's name: its tools are mcp__manager__*
+AUTO_SERVER = "window"  # outside manager mode: the one tool for Jarvis to turn it on (mcp__window__*)
 # /keepitgoin: a turn cut off by the usage limit carries on by itself once the limit resets,
 # at most this many times in a row (a limit that's still there when it says it reset). The
 # window's own turns and its threads' turns alike.
@@ -146,6 +147,31 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["thread"], "properties": {"thread": THREAD}}},
     {"name": "stop_thread", "_meta": LOADED, "description": "Interrupt a worker's turn.",
      "inputSchema": {"type": "object", "required": ["thread"], "properties": {"thread": THREAD}}},
+]
+
+
+# Outside manager mode, Jarvis can turn it on itself for a task that's worth it.
+AUTO_MANAGER_PROMPT = """# Turning on project manager mode
+This window has a project manager mode (/manager): you become a coordinator that hands tasks to \
+worker Jarvises running at the same time, each a full Claude Code session of its own. It's off \
+now. When the owner gives you a task that would go clearly faster in parallel and use the \
+owner's plan no worse, turn it on yourself with mcp__window__manager_mode before you start on \
+the work: a big job with several parts that can be done at the same time without getting in \
+each other's way (a feature across separate areas of a codebase, a batch of independent \
+fixes, research along several separate lines). Each worker starts cold and has to find its \
+own way around, so don't for questions, conversation, small or quick changes, or work whose \
+steps depend on each other one after another; do those yourself as usual. After the call, \
+end your turn at once with one short line to the owner: the window restarts you as the \
+coordinator, with the tools for threads, and sends you a message to carry on with the task."""
+AUTO_MANAGER_CONTINUE = ("<manager-mode>The window has turned project manager mode on, as you asked. You're "
+                         "the coordinator now: carry on with the owner's last request, handing the work to "
+                         "threads. This message comes from the window, not the owner.</manager-mode>")
+AUTO_TOOLS = [
+    {"name": "manager_mode", "_meta": LOADED,
+     "description": "Turn on project manager mode for a big task that splits into parts that can run at the "
+                    "same time. Call it before starting the work, then end your turn at once.",
+     "inputSchema": {"type": "object", "required": ["reason"], "properties": {
+         "reason": {"type": "string", "description": "A few words for the owner: why this task is worth it"}}}},
 ]
 
 
@@ -324,7 +350,7 @@ class Thread:
                 if text and update_notice(text) is not None:  # news from one of its threads
                     await self.add(NoticeEntry(update_notice(text), attached=False))
                 elif text:
-                    await self.add(UserEntry(text))
+                    await self.add(UserEntry(text, at=msg.get("timestamp")))
                 elif msg["type"] == "user":
                     await self.on_user(msg)
                 elif msg["type"] == "assistant":
@@ -462,7 +488,7 @@ class Thread:
             return False
         coordinator, self.for_coordinator = self.for_coordinator, False
         self.status, self.resumes = "paused", resets
-        self.app.set_timer(resets - time.time() + 1, lambda: self.app.run_worker(
+        self.app.alarm(f"thread-{self.number}", resets, lambda: self.app.run_worker(
             self.carry_on(resets, coordinator), group=f"thread-{self.number}"))
         return True
 
@@ -557,7 +583,7 @@ class Thread:
         for block in content:
             kind = block.get("type")
             if kind == "text" and block.get("text", "").strip():
-                await self.add(AssistantEntry(block["text"]))
+                await self.add(AssistantEntry(block["text"], at=msg.get("timestamp")))
             elif kind in ("thinking", "redacted_thinking") and (block.get("thinking") or "").strip():
                 await self.add(ThinkingEntry(block["thinking"], self.verbose, done=True))
             elif kind in ("tool_use", "server_tool_use", "mcp_tool_use") and block.get("id") not in self.tools:

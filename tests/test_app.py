@@ -5,6 +5,7 @@ import io
 import json
 import os
 import platform
+import re
 import sys
 import time
 
@@ -16,7 +17,7 @@ from textual.widget import Widget
 from jarvis_code import app as app_module, sessions, theme
 from jarvis_code.app import JarvisApp, Options
 from jarvis_code.widgets import (AssistantEntry, NoticeEntry, Picker, SessionsPage, Splash, ThinkingEntry,
-                                 ToolEntry, UnqueueButton, UserEntry)
+                                 ToolEntry, UnqueueButton, UserEntry, clock)
 
 FAKE = [sys.executable, os.path.join(os.path.dirname(__file__), "fake_claude.py")]
 SIZE = (110, 40)
@@ -32,6 +33,12 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions, "FINISHED", str(tmp_path / "jarvis-finished.json"))
     (tmp_path / "notes.txt").write_text("alpha\n")
     return tmp_path
+
+
+def permission_responses(home):
+    """What the window answered Claude Code's permission requests (not its MCP servers' replies)."""
+    return [m["response"]["response"] for m in sent(home) if m.get("type") == "control_response"
+            and "mcp_response" not in (m["response"].get("response") or {})]
 
 
 def make(home, **kw):
@@ -75,6 +82,11 @@ def replies(app):
     return [e.text.strip() for e in entries(app, AssistantEntry)]
 
 
+def stamp(entry):
+    """The time shown at the right of a prompt or reply ("" if none)."""
+    return str(entry.stamp.content) if entry.stamp is not None else ""
+
+
 async def test_banner_and_hello(home):
     app = make(home)
     async with app.run_test(size=SIZE) as pilot:
@@ -84,6 +96,8 @@ async def test_banner_and_hello(home):
         await send(pilot, "hello")
         await until(pilot, lambda: replies(app) == ["Hello, sir. How may I help?"] and not app.busy)
         assert [e.text for e in entries(app, UserEntry)] == ["hello"]
+        for entry in entries(app, UserEntry) + entries(app, AssistantEntry):  # said today: the time alone
+            assert re.fullmatch(r"\d{1,2}:\d\d [ap]m", stamp(entry)), stamp(entry)
         await until(pilot, lambda: "3% context" in app.footer.right)
         assert not app.spinner.display
         assert sessions.read_history(str(home)) == ["hello"]
@@ -101,7 +115,7 @@ async def test_permission_yes_and_dont_ask_again(home):
         await until(pilot, lambda: not app.busy and replies(app))
         tool = entries(app, ToolEntry)[0]
         assert tool.state == "done" and app.mode == "acceptEdits"
-        response = [m for m in sent(home) if m.get("type") == "control_response"][0]["response"]["response"]
+        response = permission_responses(home)[0]
         assert response["behavior"] == "allow" and response["updatedPermissions"][0]["mode"] == "acceptEdits"
         assert "Updated notes.txt with 1 addition and 1 removal" in text_of(tool.result_view.content)
 
@@ -115,7 +129,7 @@ async def test_permission_rejected_with_esc(home):
         await pilot.press("escape")
         await until(pilot, lambda: not app.busy)
         assert entries(app, ToolEntry)[0].state == "rejected"
-        response = [m for m in sent(home) if m.get("type") == "control_response"][0]["response"]["response"]
+        response = permission_responses(home)[0]
         assert response["behavior"] == "deny" and response["interrupt"] is True
         assert app.prompt.has_focus
 
@@ -661,12 +675,14 @@ async def test_resume_shows_saved_conversation(home):
     folder = home / "projects" / sessions.project_dir(cwd).split("/")[-1]
     folder.mkdir(parents=True)
     records = [
-        {"type": "user", "message": {"role": "user", "content": "what's in notes?"}},
+        {"type": "user", "message": {"role": "user", "content": "what's in notes?"},
+         "timestamp": "2026-10-28T19:20:00.000Z"},
         {"type": "assistant", "message": {"id": "m1", "role": "assistant", "content": [
             {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": f"{cwd}/notes.txt"}}]}},
         {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "1\talpha"}]},
          "toolUseResult": {"type": "text", "file": {"numLines": 1}}},
-        {"type": "assistant", "message": {"id": "m2", "role": "assistant", "content": [{"type": "text", "text": "It says alpha."}]}},
+        {"type": "assistant", "message": {"id": "m2", "role": "assistant", "content": [{"type": "text", "text": "It says alpha."}]},
+         "timestamp": "2026-10-28T19:21:30.000Z"},
     ]
     (folder / "s1.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
     app = make(home, resume="s1")
@@ -674,6 +690,10 @@ async def test_resume_shows_saved_conversation(home):
         await ready(pilot)
         assert [e.text for e in entries(app, UserEntry)] == ["what's in notes?"]
         assert replies(app) == ["It says alpha."]
+        # each shows when it was said, with the day, since that wasn't today
+        assert stamp(entries(app, UserEntry)[0]) == clock("2026-10-28T19:20:00.000Z")
+        assert stamp(entries(app, AssistantEntry)[0]) == clock("2026-10-28T19:21:30.000Z")
+        assert stamp(entries(app, UserEntry)[0]).startswith("Oct 28 ")
         assert "Read 1 line" in text_of(entries(app, ToolEntry)[0].result_view.content)
         assert ["--resume", "s1"] == next(m["argv"] for m in sent(home) if "argv" in m)[-2:] or \
             "--resume" in next(m["argv"] for m in sent(home) if "argv" in m)
@@ -1385,7 +1405,8 @@ async def test_manager_hands_the_work_to_threads(home):
         init = [m for m in sent(home) if (m.get("request") or {}).get("subtype") == "initialize"]
         assert any(m["request"].get("sdkMcpServers") == ["manager"] for m in init)
         replies_to_mcp = [((m.get("response") or {}).get("response") or {}).get("mcp_response") for m in sent(home)]
-        listed = [r["result"]["tools"] for r in replies_to_mcp if r and isinstance(r["result"].get("tools"), list)]
+        listed = [r["result"]["tools"] for r in replies_to_mcp if r and isinstance(r["result"].get("tools"), list)
+                  and r["result"]["tools"][0]["name"] == "start_thread"]  # not the window's manager_mode, from before
         assert {t["name"] for t in listed[0]} == {"start_thread", "message_thread", "list_threads",
                                                   "read_thread", "stop_thread"}
         assert all(t["_meta"]["anthropic/alwaysLoad"] for t in listed[0])
@@ -1436,7 +1457,8 @@ async def test_a_manager_thread_runs_threads_of_its_own(home):
         assert (one.parent, two.parent, one.depth) == (boss, boss, 2)
         assert not one.is_manager and not one.can_manage
         # The manager thread has the tools, minus making managers: its threads are as deep as it goes.
-        listed = [r["result"]["tools"] for r in mcp_replies(home) if isinstance(r["result"].get("tools"), list)]
+        listed = [r["result"]["tools"] for r in mcp_replies(home) if isinstance(r["result"].get("tools"), list)
+                  and r["result"]["tools"][0]["name"] == "start_thread"]
         assert "manager" in listed[0][0]["inputSchema"]["properties"]
         assert "manager" not in listed[1][0]["inputSchema"]["properties"]
         # Its threads are listed beneath it, indented.
@@ -1571,4 +1593,100 @@ async def test_messaging_a_thread_and_manager_off(home):
                                        for e in entries(app, NoticeEntry) if not isinstance(e.renderable, Widget)))
         assert not app.manager_pane.display and not any(e.running for e in engines)
         init = [m for m in sent(home) if (m.get("request") or {}).get("subtype") == "initialize"]
-        assert "sdkMcpServers" not in init[-1]["request"]
+        assert init[-1]["request"].get("sdkMcpServers") == ["window"]  # just the tool to turn it on again
+
+
+def notices(app):
+    return [text_of(e.renderable) for e in entries(app, NoticeEntry) if not isinstance(e.renderable, Widget)]
+
+
+async def test_colour_changes_the_whole_window_and_is_saved(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        assert app.painter.name == "blue"
+        await send(pilot, "/colour red")
+        await until(pilot, lambda: app.painter.name == "red")
+        assert app_module.load_setting("colour", None) == "red"
+        assert "38;2;60;190;255" not in app.painter.paint("\x1b[38;2;60;190;255mx")  # theme.ACCENT, blue no more
+        await send(pilot, "/colour mauve")
+        await pilot.pause()
+        assert app.painter.name == "red" and "Usage: /colour" in app.footer.flash_text
+        await send(pilot, "/color gray")
+        await until(pilot, lambda: app.painter.name == "grey")
+        await send(pilot, "/colour blue")
+        await until(pilot, lambda: app.painter.name == "blue")
+        assert app_module.load_setting("colour", None) is None
+
+
+async def test_colour_picks_from_a_list(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/colour")
+        await until(pilot, lambda: isinstance(app.dialog, Picker))
+        for key in "purple":
+            await pilot.press(key)
+        await pilot.press("enter")
+        await until(pilot, lambda: app.painter.name == "purple")
+
+
+async def test_a_window_opened_in_a_colour_starts_in_it(home):
+    app_module.save_setting("colour", "green")
+    assert make(home).painter.name == "green"  # the saved one
+    assert make(home, colour="grey").painter.name == "grey"  # --colour, for this window only
+    assert app_module.load_setting("colour", None) == "green"
+
+
+async def test_compact_has_no_big_letters(home, monkeypatch):
+    monkeypatch.setattr(theme, "BIG_LETTERS", False)
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        shown = text_of(app.banner.render(), 120)
+        assert "██" not in shown and "J.A.R.V.I.S." in shown
+        assert "██" not in text_of(Splash().render(), 120)
+
+
+async def test_rename_titles_the_terminal_window_too(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/rename Colour work")
+        await until(pilot, lambda: app.tab_title == "Colour work")
+        await until(pilot, lambda: not app.busy)
+        await pilot.pause(0.3)
+        assert app.tab_title == "Colour work"
+        assert any(m.get("message", {}).get("content") == "/rename Colour work" for m in sent(home)
+                   if m.get("type") == "user")
+
+
+async def test_jarvis_turns_manager_mode_on_for_a_big_job(home):
+    app = make(home)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await ready(pilot)
+        await send(pilot, "here's a big job")
+        await until(pilot, lambda: app.manager is not None and len(app.manager.threads) == 1)
+        assert app.manager.threads[0].title == "First part" and app.manager_pane.display
+        assert any("turned project manager mode on for this: three separate parts" in n for n in notices(app))
+        await until(pilot, lambda: "A thread has the first part." in replies(app))
+        assert "Carrying on as coordinator" in " ".join(notices(app))
+        # The task went back to it as the window's message, not as one of yours.
+        assert [e.text for e in entries(app, UserEntry)] == ["here's a big job"]
+
+
+async def test_manager_auto_off_leaves_it_to_you(home):
+    app = make(home)
+    async with app.run_test(size=SIZE) as pilot:
+        await ready(pilot)
+        await send(pilot, "/manager auto off")
+        await until(pilot, lambda: not app.auto_manager and app.engine_state == "running")
+        assert app_module.load_setting("manager_auto", None) is False
+        await until(pilot, lambda: "sdkMcpServers" not in [m for m in sent(home)
+                    if (m.get("request") or {}).get("subtype") == "initialize"][-1]["request"])
+        await send(pilot, "here's a big job")
+        await until(pilot, lambda: not app.busy and replies(app))
+        assert app.manager is None
+        await send(pilot, "/manager auto")  # toggles
+        await until(pilot, lambda: app.auto_manager)
+        assert app_module.load_setting("manager_auto", None) is None

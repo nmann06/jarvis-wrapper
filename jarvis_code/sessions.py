@@ -220,7 +220,8 @@ def load_conversation(path):
                                  "timestamp": record.get("timestamp")})
             elif kind == "assistant":
                 messages.append({"type": "assistant", "message": record.get("message"),
-                                 "parent_tool_use_id": None, "_history": True})
+                                 "parent_tool_use_id": None, "_history": True,
+                                 "timestamp": record.get("timestamp")})
             elif kind == "system" and record.get("subtype") == "compact_boundary":
                 messages.append({"type": "system", "subtype": "compact_boundary", "_history": True})
     return messages

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# The Jarvis window in grey, with a one-line J.A.R.V.I.S. on top instead of the big letters.
+# Takes jarvis's options too (-c, -r, --model...).
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/jarvis-code" --colour grey --compact "$@"

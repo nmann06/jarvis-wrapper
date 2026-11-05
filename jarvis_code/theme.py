@@ -15,6 +15,7 @@ LETTERS = {
     "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
 }
 JARVIS_ROWS = ["".join(LETTERS[c][row] for c in "JARVIS") for row in range(6)]
+BIG_LETTERS = True  # False (--compact): the one-line ◆ J.A.R.V.I.S. on top instead, however wide the window
 
 # Light at the top of the letters to deep at the bottom.
 GRADIENT = ["#96e6ff", "#5acdff", "#28afff", "#148cf0", "#0f69d7", "#0a4bb4"]

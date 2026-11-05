@@ -3,7 +3,9 @@ spinner, task list, prompt, suggestion menu, footer, and the dialogs that take t
 place when Claude Code asks for permission or has a question."""
 
 import asyncio
+import datetime as dt
 import io
+import os
 import time
 
 from rich.console import Console, Group
@@ -48,7 +50,7 @@ class Banner(Static):
         i = self.info
         width = self.size.width or 80
         lines = []
-        if width >= len(theme.JARVIS_ROWS[0]) + 2:
+        if theme.BIG_LETTERS and width >= len(theme.JARVIS_ROWS[0]) + 2:
             for row, colour in zip(theme.JARVIS_ROWS, theme.GRADIENT):
                 lines.append(Text(row, style=f"bold {colour}"))
             lines.append(Text.assemble(("Just A Rather Vaguely Intelligent System", f"{theme.LABEL}"),
@@ -77,7 +79,7 @@ class Splash(Static):
     DEFAULT_CSS = "Splash { height: auto; padding: 1 0; }"
 
     def render(self):
-        if (self.size.width or 80) < len(theme.JARVIS_ROWS[0]) + 2:
+        if not theme.BIG_LETTERS or (self.size.width or 80) < len(theme.JARVIS_ROWS[0]) + 2:
             return Text("◆ J.A.R.V.I.S.", style=f"bold {theme.ACCENT}", justify="center")
         lines = [Text(row, style=f"bold {colour}", justify="center")
                  for row, colour in zip(theme.JARVIS_ROWS, theme.GRADIENT)]
@@ -112,8 +114,23 @@ class CollapseButton(Static):
         self.query_ancestor(Entry).collapse()
 
 
+def clock(at=None):
+    """When something was said, for the right of its first line: 3:42 pm, or Oct 28 3:42 pm on
+    another day. at is epoch seconds, a saved record's ISO timestamp, or None for now."""
+    try:
+        if isinstance(at, str):
+            when = dt.datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone()
+        else:
+            when = dt.datetime.fromtimestamp(time.time() if at is None else at)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+    fmt = "%-I:%M" if when.date() == dt.date.today() else "%b %-d %-I:%M"
+    return when.strftime(fmt.replace("%-", "%#") if os.name == "nt" else fmt) + " " + when.strftime("%p").lower()
+
+
 class Entry(Horizontal):
-    """One thing in the transcript: a glyph in a two-column gutter, then the body."""
+    """One thing in the transcript: a glyph in a two-column gutter, then the body (and, for
+    what you and Jarvis say, the time it was said)."""
 
     DEFAULT_CSS = f"""
     Entry {{ height: auto; margin-top: 1; }}
@@ -121,17 +138,22 @@ class Entry(Horizontal):
     Entry.found {{ background: {theme.PICKED_BG}; }}  /* the ctrl+f match on show */
     Entry > .gutter {{ width: 2; height: auto; }}
     Entry > .body {{ width: 1fr; height: auto; }}
+    Entry > .stamp {{ width: auto; height: 1; padding: 0 1 0 2; color: {theme.DIM}; }}
     """
 
-    def __init__(self, glyph, glyph_style, body, classes=""):
+    def __init__(self, glyph, glyph_style, body, classes="", at=False):
         super().__init__(classes=classes)
         self.glyph_view = Static(Text(glyph, style=glyph_style), classes="gutter")
         self.body = body
         self.body.add_class("body")
+        stamp = clock(at) if at is not False else ""  # at=False: no time shown
+        self.stamp = Static(Text(stamp), classes="stamp") if stamp else None
 
     def compose(self):
         yield self.glyph_view
         yield self.body
+        if self.stamp is not None:
+            yield self.stamp
 
     def set_glyph(self, glyph, style):
         self.glyph_view.update(Text(glyph, style=style))
@@ -168,16 +190,17 @@ class UserEntry(Entry):
     UserEntry {{ background: {theme.USER_BG}; padding-right: 1; }}
     UserEntry.picked {{ background: {theme.PICKED_BG}; }}
     UserEntry.picked > .gutter {{ color: {theme.ACCENT}; }}
+    UserEntry > .stamp {{ padding-right: 0; }}  /* it has padding of its own */
     """
 
-    def __init__(self, text, glyph=">", glyph_style=theme.DIM):
+    def __init__(self, text, glyph=">", glyph_style=theme.DIM, at=None):
         self.text = text
         quoted, said = split_reply(text) if glyph == ">" else (None, text)
         body = Text(said)
         if quoted:  # a reply: what it replies to, in grey on one line above it
             line = Text(one_line(quoted), style=theme.DIM, no_wrap=True, overflow="ellipsis")
             body = Group(line, body)
-        super().__init__(glyph, glyph_style, Static(body, markup=False))
+        super().__init__(glyph, glyph_style, Static(body, markup=False), at=at)
 
     def plain(self):
         return f"> {self.text}"
@@ -186,11 +209,11 @@ class UserEntry(Entry):
 class AssistantEntry(Entry):
     """Jarvis's words, as Markdown, streamed in as they arrive."""
 
-    def __init__(self, text=""):
+    def __init__(self, text="", at=None):
         self.text = text
         self.markdown = Markdown(text, classes="reply")
         self._stream = None
-        super().__init__(theme.BULLET, "", self.markdown)
+        super().__init__(theme.BULLET, "", self.markdown, at=at)
 
     async def append(self, fragment):
         if not fragment:

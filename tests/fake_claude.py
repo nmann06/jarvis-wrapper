@@ -167,7 +167,21 @@ def turn(prompt, message_uuid=None):
         result()
         return
 
-    if "think" in p:
+    if "big job" in p and "window" in state.get("sdk_tools", {}):  # worth turning manager mode on for
+        args = {"reason": "three separate parts"}
+        tool_use(mid, "toolu_auto", "mcp__window__manager_mode", args)
+        if ask("mcp__window__manager_mode", args, "toolu_auto").get("behavior") == "allow":
+            reply = mcp("window", "tools/call", {"name": "manager_mode", "arguments": args}, 50)
+            tool_result("toolu_auto", reply["result"]["content"])
+        stream_text(mid, 1, "Handing this to threads.")
+    elif "<manager-mode>" in prompt and "manager" in state.get("sdk_tools", {}):
+        args = {"title": "First part", "prompt": "say hello"}
+        tool_use(mid, "toolu_first", "mcp__manager__start_thread", args)
+        if ask("mcp__manager__start_thread", args, "toolu_first").get("behavior") == "allow":
+            reply = mcp("manager", "tools/call", {"name": "start_thread", "arguments": args}, 51)
+            tool_result("toolu_first", reply["result"]["content"])
+        stream_text(mid, 1, "A thread has the first part.")
+    elif "think" in p:
         emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
                                                 "content_block": {"type": "thinking", "thinking": ""}}})
         for part in ("Seventeen times ", "twenty-three is 391."):

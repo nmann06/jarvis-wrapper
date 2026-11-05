@@ -14,6 +14,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 
 # Set by the Claude Code session a shell may be running inside. Inherited, they make the
@@ -226,7 +227,9 @@ class Engine:
 
     def _trace(self, direction, line):
         if self.log:
-            self.log.write(f"{direction} {line if line.endswith(chr(10)) else line + chr(10)}")
+            now = time.time()
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+            self.log.write(f"{stamp} {direction} {line if line.endswith(chr(10)) else line + chr(10)}")
 
     async def _read(self):
         try:

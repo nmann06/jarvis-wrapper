@@ -7,7 +7,8 @@ Jarvis's persona on top. What it does and how it's used are in "The Jarvis windo
 
 On hyde it lives in `~/jarvis-wrapper`; `jarvis` in the shell (`~/.bashrc`) runs `jarvis-code`,
 and `jarvis` in PowerShell (`deploy/jarvis.ps1` in jarvis) copies `jarvis_code/`, `launch.py`
-and `requirements.txt` from here to the Windows laptop with `jarvis --update`.
+and `requirements.txt` from here to the Windows laptop with `jarvis --update`. `jarvis-grey`
+runs `jarvis-code --colour grey --compact` (symlinked into `~/.local/bin` on hyde).
 
 ## Setup
 

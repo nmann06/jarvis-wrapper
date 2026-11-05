@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import unquote, urlparse
@@ -32,10 +33,11 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import Markdown, Static
 
-from . import __version__, config_items, files, persona, runs, sessions, stats, theme, tools
+from . import __version__, colour, config_items, files, persona, presence, runs, sessions, stats, theme, tools, watchdog
 from .engine import DETACHED, Engine, EngineError, claude_command, claude_path, clean_environment, usage_limit
 from .jarvis_settings import JarvisSettingsPage, JarvisSettingsPanel
-from .manager import (KEEP_GOING_PROMPT, KEEP_GOING_TRIES, MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager,
+from .manager import (AUTO_MANAGER_CONTINUE, AUTO_MANAGER_PROMPT, AUTO_SERVER, AUTO_TOOLS, KEEP_GOING_PROMPT,
+                      KEEP_GOING_TRIES, MANAGER_PROMPT, SERVER, THREAD_LIMIT, Manager,
                       ManagerPane, update_notice)
 from .panels import McpPanel, Panel, SettingsPanel, strftime
 from .widgets import (AssistantEntry, Banner, Dialog, DoneEntry, Entry, Footer, NoticeEntry,
@@ -95,12 +97,14 @@ LOCAL_COMMANDS = {
     "finished": "Mark this conversation as finished in the list of conversations (/finished off to undo)",
     "keepitgoin": "Carry on by itself when a usage limit resets (/keepitgoin on|off; no args toggles)",
     "mute": "Jarvis stops saying when this window finishes (/mute again to unmute)",
+    "colour": "Change the colour of the whole window (saved, for new windows too)",
+    "rename": "Rename this conversation, and the terminal window's title with it",
     "computer": "Show which computer this window is running on",
     "fuck": "Stop Jarvis right now, like esc",
     "exit": "Exit Jarvis",
 }
 ALIASES = {"quit": "exit", "q": "exit", "new": "clear", "reset": "clear", "continue": "resume",
-           "cost": "usage", "cc": "claude", "settings": "config", "default-effort": "default-usage"}
+           "cost": "usage", "cc": "claude", "color": "colour", "settings": "config", "default-effort": "default-usage"}
 SETTINGS_TABS = {"usage": "usage", "status": "status", "config": "config", "stats": "stats"}
 # Claude Code screens with no headless form; /claude opens them on the same conversation.
 ONLY_IN_CLAUDE = {"login", "logout", "plugin", "plugins", "permissions", "allowed-tools", "hooks",
@@ -131,6 +135,7 @@ class Options:
     thinking_display: str = "summarized"
     engine_command: list | None = None  # tests swap in a fake Claude Code
     log_path: str | None = None
+    colour: str | None = None       # this window's colour (/colour's saved one if None)
     extra: dict = field(default_factory=dict)
 
 
@@ -484,6 +489,10 @@ class JarvisApp(App):
         self.updates = set() # uuids of /manager's thread updates not yet taken in
         self.manager = None  # project manager mode's threads (manager.py), when it's on
         self.thread_limit = thread_limit()  # /manager-thread-limit
+        self.auto_manager = load_setting("manager_auto", True)  # Jarvis may turn manager mode on (/manager auto)
+        self.auto_manager_reason = None  # it asked to, this turn: why
+        self.renaming = False  # /rename ran: read the conversation's title again after it
+        self.painter = colour.Painter(colour.name_of(self.options.colour) or load_setting("colour", colour.DEFAULT))
         self.capabilities = set()  # what Claude Code says it can do, on system/init
         self.chord_until = 0.0     # ctrl+x was pressed; s before this sends now
         self.jumped = None   # the message of yours alt+up / alt+down last scrolled to
@@ -524,6 +533,8 @@ class JarvisApp(App):
         self.stats_cache = (0.0, None)    # (when, stats.Stats)
         self.commands_pending = False     # a /model or /effort ran: read the settings again after it
         self.show_tasks_idle = False
+        self.watchdog = watchdog.Watchdog(self)  # writes down why, should the window stop drawing
+        self.alarms = {}                  # name -> the timer for a time of day (alarm())
 
     # Layout ---------------------------------------------------------------------------------
 
@@ -544,6 +555,7 @@ class JarvisApp(App):
         yield Footer(id="footer")
 
     async def on_mount(self):
+        self.paint_output()
         self.register_theme(JARVIS_THEME)
         self.theme = "jarvis"
         self.transcript = self.query_one(Transcript)
@@ -566,6 +578,8 @@ class JarvisApp(App):
         self.submissions = asyncio.Queue()
         self.set_interval(0.08, self.tick)
         self.set_interval(USAGE_REFRESH, self.refresh_usage)
+        self.set_interval(presence.EVERY, lambda: presence.write(self))  # for hyde's nightly restart
+        presence.write(self)
         self.run_worker(self.permission_loop(), group="permissions")
         self.run_worker(self.submission_loop(), group="submissions")
         self.run_worker(self.file_index.load(), group="files")
@@ -573,6 +587,8 @@ class JarvisApp(App):
         self.footer.mode = self.mode
         self.update_footer()
         self.prompt.focus()
+        if not self.is_headless:
+            self.watchdog.start()
         self.run_worker(self.boot(), group="boot")
 
     async def boot(self):
@@ -603,14 +619,18 @@ class JarvisApp(App):
 
     async def start_engine(self, resume=None):
         system_prompt = persona.PERSONA if self.options.persona else None
+        auto = self.manager is None and self.auto_manager  # it may turn manager mode on itself
         if self.manager is not None:  # the coordinator, with the tools to run its threads
             system_prompt = (system_prompt + "\n\n" if system_prompt else "") + MANAGER_PROMPT
+        elif auto:
+            system_prompt = (system_prompt + "\n\n" if system_prompt else "") + AUTO_MANAGER_PROMPT
         engine = Engine(self.cwd, None, None, model=self.model_override, effort=self.effort_override,
                         permission_mode=self.mode if self.mode != "default" else None,
                         resume=resume, append_system_prompt=system_prompt,
                         thinking_display=self.options.thinking_display,
-                        sdk_mcp_servers=[SERVER] if self.manager is not None else (),
-                        on_mcp=self.manager.handle_mcp if self.manager is not None else None,
+                        sdk_mcp_servers=[SERVER] if self.manager is not None else [AUTO_SERVER] if auto else (),
+                        on_mcp=self.manager.handle_mcp if self.manager is not None else
+                        self.handle_window_mcp if auto else None,
                         env={"JARVIS_WINDOW": self.window_id},
                         command=self.options.engine_command, log_path=self.options.log_path)
         engine.on_message = lambda msg: self.on_engine_message(engine, msg)
@@ -672,8 +692,16 @@ class JarvisApp(App):
     def set_session_end(self, when):
         if when and when != self.session_ends:
             self.session_ends = when
-            self.set_timer(max(0.0, when - time.time()) + 1, self.session_over)
+            self.alarm("session", when, self.session_over)
             self.update_footer()
+
+    def alarm(self, name, when, callback):
+        """callback a second after when (epoch seconds), replacing the last alarm of that name:
+        the usage numbers come in again every minute, and a timer each time piled up."""
+        old = self.alarms.pop(name, None)
+        if old is not None:
+            old.stop()
+        self.alarms[name] = self.set_timer(max(0.0, when - time.time()) + 1, callback)
 
     def session_over(self):
         """The 5-hour window's end came: what it used no longer counts. Ask for the new one."""
@@ -890,7 +918,7 @@ class JarvisApp(App):
                 if entry is not None:
                     await entry.finish(block.get("text", ""))
                 elif block.get("text", "").strip():
-                    await self.add(AssistantEntry(block["text"]))
+                    await self.add(AssistantEntry(block["text"], at=msg.get("timestamp")))
             elif btype in ("thinking", "redacted_thinking"):
                 entry = None if history else self.take_waiting(message_id, ThinkingEntry)
                 if entry is not None:
@@ -935,7 +963,7 @@ class JarvisApp(App):
         if parent:
             return  # the prompt Jarvis gave a subagent
         if msg.get("_history"):
-            await self.show_saved_prompt(user_text(content))
+            await self.show_saved_prompt(user_text(content), msg.get("timestamp"))
             return
         if msg.get("isReplay"):
             await self.on_replay(user_text(content), msg.get("uuid"))
@@ -944,7 +972,8 @@ class JarvisApp(App):
         """Claude Code took in a prompt: show it if it was waiting in the queue."""
         if message_uuid in self.updates:  # a /manager thread's news, for the coordinator
             self.updates.discard(message_uuid)
-            await self.add(NoticeEntry(update_notice(text) or notice("A thread update"), attached=False))
+            fallback = "Carrying on as coordinator" if text.startswith("<manager-mode>") else "A thread update"
+            await self.add(NoticeEntry(update_notice(text) or notice(fallback), attached=False))
             if not self.busy:
                 self.begin_turn()
             return
@@ -967,8 +996,9 @@ class JarvisApp(App):
     def show_queued(self):
         self.queued_panel.show([(message_uuid, text) for text, shown, message_uuid in self.sent if not shown])
 
-    async def show_saved_prompt(self, text):
-        """A user record from a saved conversation: a prompt, a command, or ! output."""
+    async def show_saved_prompt(self, text, at=None):
+        """A user record from a saved conversation: a prompt, a command, or ! output (at: its
+        ISO timestamp)."""
         text = text.strip()
         if not text or text.startswith(("<system-reminder>", "<local-command-caveat>", "Caveat:")):
             return
@@ -981,7 +1011,7 @@ class JarvisApp(App):
         name = tag(text, "command-name")
         if name:
             args = (tag(text, "command-args") or "").strip()
-            await self.add(UserEntry(f"{name} {args}".strip()))
+            await self.add(UserEntry(f"{name} {args}".strip(), at=at))
             return
         stdout = tag(text, "local-command-stdout")
         if stdout is not None:
@@ -990,14 +1020,14 @@ class JarvisApp(App):
             return
         command = tag(text, "bash-input")
         if command is not None:
-            await self.add(UserEntry(command, "!", f"bold {theme.BASH_MODE}"))
+            await self.add(UserEntry(command, "!", f"bold {theme.BASH_MODE}", at=at))
             return
         if text.startswith("<bash-stdout>"):
             out = (tag(text, "bash-stdout") or "") + (tag(text, "bash-stderr") or "")
             await self.add(NoticeEntry(draw=lambda verbose: tools.block(
                 tools.plain_lines(out, verbose) or [Text("(No output)", style=theme.DIM)]), verbose=self.verbose))
             return
-        await self.add(UserEntry(text))
+        await self.add(UserEntry(text, at=at))
 
     def command_output(self, text):
         """What a slash command printed: Markdown when it's a table or headed report."""
@@ -1084,6 +1114,11 @@ class JarvisApp(App):
         else:
             self.show_queued()
             self.end_turn()
+            if self.auto_manager_reason is not None:
+                self.run_worker(self.enter_auto_manager(), group="auto-manager")
+            if self.renaming:
+                self.renaming = False
+                self.titled = None  # read it again: Claude Code has just saved the new one
         self.run_worker(self.refresh_context(), group="context")
         self.refresh_usage()
         self.name_conversation()
@@ -1109,7 +1144,7 @@ class JarvisApp(App):
         if self.limit_note and self.busy:
             self.stalled = resets or None  # cut off mid-turn: /keepitgoin carries on at the reset
         if self.limit_note and resets:
-            self.set_timer(max(0.0, resets - time.time()) + 1, lambda: self.limit_over(resets))
+            self.alarm("limit", resets, lambda: self.limit_over(resets))
         self.update_footer()
 
     def limit_over(self, resets):
@@ -1161,6 +1196,43 @@ class JarvisApp(App):
         else:
             await self.note("Unmuted: Jarvis says when this window finishes a long task again.")
 
+    def paint_output(self):
+        """Everything written to the terminal goes through the painter, which turns Jarvis blue
+        into the window's colour (colour.py)."""
+        driver = getattr(self, "_driver", None)
+        if driver is None or getattr(driver, "jarvis_painted", False):
+            return
+        write = driver.write
+        driver.write = lambda data: write(self.painter.paint(data))
+        driver.jarvis_painted = True
+
+    async def cmd_colour(self, args):
+        """/colour [name]: the whole window in another colour, this one and new ones (saved)."""
+        name = args
+        if not name:
+            items = [(c, c + ("  (current)" if c == self.painter.name else ""), "Jarvis's own" if c == colour.DEFAULT
+                      else "") for c in colour.COLOURS]
+            name = await self.show_dialog(Picker("Choose Jarvis's colour", items))
+            if not name:
+                return
+        name = colour.name_of(name)
+        if name is None:
+            self.footer.flash(f"Usage: /colour <{'|'.join(colour.COLOURS)}>", 3)
+            return
+        self.painter.name = name
+        save_setting("colour", None if name == colour.DEFAULT else name)
+        self.screen.refresh()  # the whole screen again, in the new colour
+        await self.note(f"Jarvis is {name} now, here and in new windows.")
+
+    async def cmd_rename(self, args):
+        """/rename [name]: Claude Code renames the conversation; the terminal window's title
+        follows, at once with a name given, or once Claude Code has thought of one."""
+        if args:
+            self.set_tab_title(tools.one_line(args, 60))
+            self.titled = self.session_id  # named now: don't go looking for another
+        self.renaming = True
+        await self.run_engine_command("/rename" + (f" {args}" if args else ""))
+
     def set_muted(self, muted):
         path = os.path.join(MUTED, self.window_id)
         if muted:
@@ -1201,6 +1273,7 @@ class JarvisApp(App):
         self.interrupting = False
         self.turn_started = time.monotonic()
         self.tokens_done = self.tokens_current = 0
+        presence.write(self)
         self.spinner.start()
         self.spinner.message = self.active_task()
         self.refresh_tasks()
@@ -1237,6 +1310,7 @@ class JarvisApp(App):
             await asyncio.sleep(0.05)
 
     def tick(self):
+        self.watchdog.beat()
         # Follow new output once there's more than a screenful (anchoring sooner would sit
         # the banner at the bottom); scrolling up lets go until you're back at the end. Once
         # it all fits again (a dialog that squeezed it has closed), let go, banner at the top.
@@ -1326,7 +1400,7 @@ class JarvisApp(App):
         tools and set_mode."""
         view = view or self
         name = request.get("tool_name") or ""
-        if name.startswith(f"mcp__{SERVER}__"):  # the window's own tools for /manager
+        if name.startswith((f"mcp__{SERVER}__", f"mcp__{AUTO_SERVER}__")):  # the window's own tools for /manager
             return {"behavior": "allow", "updatedInput": request.get("input") or {}}
         if name == "AskUserQuestion":
             return await self.ask_questions(request_id, request.get("input") or {}, view)
@@ -1846,6 +1920,10 @@ class JarvisApp(App):
             await self.cmd_keep_going(args)
         elif name == "mute":
             await self.cmd_mute()
+        elif name == "colour":
+            await self.cmd_colour(args)
+        elif name == "rename":
+            await self.cmd_rename(args)
         elif name == "finished":
             await self.cmd_finished(args)
         elif name == "computer":
@@ -1929,6 +2007,9 @@ class JarvisApp(App):
         if args.lower() == "off":
             await self.leave_manager()
             return
+        if args.lower() in ("auto", "auto on", "auto off"):
+            await self.cmd_auto_manager(args.lower().removeprefix("auto").strip())
+            return
         if self.manager is None:
             if self.busy:
                 await self.note("Jarvis is in the middle of something; try /manager once it's done.")
@@ -1945,6 +2026,67 @@ class JarvisApp(App):
             return
         if args:
             await self.send_prompt(args)
+
+    async def cmd_auto_manager(self, value):
+        """/manager auto [on|off]: whether Jarvis turns manager mode on by itself for a task
+        that's worth it (saved; on unless turned off). No value toggles it."""
+        self.auto_manager = {"on": True, "off": False}.get(value, not self.auto_manager)
+        save_setting("manager_auto", None if self.auto_manager else False)
+        await self.note("Jarvis turns project manager mode on by itself when a task is worth it. /manager auto off "
+                        "stops that." if self.auto_manager else
+                        "Jarvis won't turn project manager mode on by itself now. /manager auto on to undo.")
+        if self.manager is None and not self.busy and self.engine is not None and self.engine.running:
+            await self.stop_engine()  # again, with the tool for it or without
+            await self.start_engine(resume=self.session_id)
+
+    async def handle_window_mcp(self, server_name, message):
+        """A JSON-RPC message to the window's own server outside manager mode: its one tool
+        turns manager mode on once the turn ends."""
+        method, message_id = message.get("method"), message.get("id")
+        if message_id is None:
+            return {"jsonrpc": "2.0", "id": None, "result": {}}
+        if server_name != AUTO_SERVER:
+            return {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": f"No server {server_name}"}}
+        if method == "initialize":
+            version = (message.get("params") or {}).get("protocolVersion") or "2025-06-18"
+            result = {"protocolVersion": version, "capabilities": {"tools": {}},
+                      "serverInfo": {"name": AUTO_SERVER, "version": "1.0"}}
+        elif method == "tools/list":
+            result = {"tools": AUTO_TOOLS}
+        elif method == "tools/call":
+            params = message.get("params") or {}
+            if params.get("name") != "manager_mode":
+                text, failed = f"No tool {params.get('name')}", True
+            elif self.manager is not None:
+                text, failed = "Project manager mode is already on.", True
+            else:
+                self.auto_manager_reason = tools.one_line(str((params.get("arguments") or {}).get("reason") or ""), 120)
+                text, failed = ("Project manager mode turns on when this turn ends. End your turn now with one short "
+                                "line to the owner; the window then restarts you as the coordinator and sends you "
+                                "a message to carry on with the task."), False
+            result = {"content": [{"type": "text", "text": text}], "isError": failed}
+        elif method == "ping":
+            result = {}
+        else:
+            return {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": f"No method {method}"}}
+        return {"jsonrpc": "2.0", "id": message_id, "result": result}
+
+    async def enter_auto_manager(self):
+        """Jarvis asked for manager mode and its turn is over: turn it on, and send it back to
+        the task as the coordinator."""
+        reason, self.auto_manager_reason = self.auto_manager_reason, None
+        if self.manager is not None or self.busy:
+            return
+        await self.note("Jarvis turned project manager mode on for this" + (f": {reason}" if reason else "") + ".")
+        await self.cmd_manager("")
+        if self.manager is not None and self.engine is not None and self.engine.running:
+            message_uuid = str(uuid.uuid4())
+            self.updates.add(message_uuid)  # shown as a line, not as a message of yours
+            try:
+                await self.engine.send(AUTO_MANAGER_CONTINUE, message_uuid)
+            except EngineError as e:
+                self.updates.discard(message_uuid)
+                await self.note(str(e), theme.ERROR)
 
     async def cmd_thread_limit(self, args):
         """/manager-thread-limit [n]: how many /manager threads may work at once, counting
@@ -2444,7 +2586,7 @@ class JarvisApp(App):
         argv = [claude_path()] + (["--resume", session_id] if session_id else [])
         env = clean_environment()
         started = time.time()
-        with self.suspend():
+        with self.hand_over():
             print("\nOpening this conversation in regular Claude Code. Exit it (/exit) to come back to Jarvis.\n",
                   flush=True)
             subprocess.run(argv, cwd=self.cwd, env=env)
@@ -2690,13 +2832,35 @@ class JarvisApp(App):
             f.write(self.prompt.text)
             path = f.name
         try:
-            with self.suspend():
+            with self.hand_over():
                 subprocess.run([*editor.split(), path])
             with open(path) as f:
                 self.prompt.set_text(f.read().rstrip("\n"))
         finally:
             os.unlink(path)
         self.prompt.focus()
+
+    @contextmanager
+    def hand_over(self):
+        """suspend(): the terminal goes to another program (/claude, ctrl+g), which the watchdog
+        doesn't count as the window being stuck."""
+        self.watchdog.paused = True
+        try:
+            with self.suspend():
+                yield
+        finally:
+            self.watchdog.paused = False
+            self.watchdog.beat()
+
+    def redraw_all(self):
+        """The terminal has caught up after some of what was drawn was left out (watchdog.py):
+        draw the whole screen again."""
+        self.screen.refresh()
+        self.refresh(layout=True)
+
+    def recovered(self, took):
+        log = watchdog.LOG.replace(os.path.expanduser("~"), "~", 1)
+        self.footer.flash(f"Jarvis was stuck for {took:.0f}s · what it was doing is in {log}", 8)
 
     async def quit(self):
         if self.manager is not None:
@@ -2705,6 +2869,8 @@ class JarvisApp(App):
         self.exit(self.session_id)
 
     async def on_unmount(self):
+        self.watchdog.stop()
+        presence.clear()
         if self.muted:  # the next window starts unmuted
             try:
                 self.set_muted(False)

@@ -6,6 +6,9 @@
     jarvis --model sonnet     start on another model (also --effort)
     jarvis --mode default     start in another permission mode (auto unless told otherwise)
     jarvis -p "fix the tests" start with a prompt
+    jarvis --colour grey      this window in another colour (/colour changes it for good)
+    jarvis --compact          a one-line J.A.R.V.I.S. on top instead of the big letters
+    jarvis-grey               both: grey, without the big letters
 """
 
 import argparse
@@ -13,6 +16,7 @@ import os
 import sys
 
 MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+COLOURS = ["blue", "cyan", "teal", "green", "yellow", "orange", "red", "pink", "purple", "grey"]  # as colour.py
 
 
 def parse(argv):
@@ -31,18 +35,30 @@ def parse(argv):
     parser.add_argument("--thinking", choices=["summarized", "omitted"],
                         default=os.environ.get("JARVIS_THINKING", "summarized"),
                         help="show summaries of Claude's thinking (default), or not")
-    parser.add_argument("--log", metavar="FILE", help="write everything said with Claude Code to FILE")
+    parser.add_argument("--colour", "--color", dest="colour", metavar="NAME",
+                        help="this window's colour: " + ", ".join(COLOURS) + " (default: /colour's choice)")
+    parser.add_argument("--compact", action="store_true",
+                        help="a one-line J.A.R.V.I.S. on top instead of the big letters")
+    parser.add_argument("--log", metavar="FILE", help="write everything said with Claude Code to FILE, each line timed")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse(sys.argv[1:] if argv is None else argv)
     from .app import JarvisApp, Options, console_title  # after parsing, so --help is instant
+    from . import colour, theme, watchdog
+
+    if args.colour and colour.name_of(args.colour) is None:
+        print(f"jarvis: no colour {args.colour!r} (there's {', '.join(colour.COLOURS)})", file=sys.stderr)
+        return 2
+    theme.BIG_LETTERS = not args.compact
+
+    watchdog.install()  # a terminal that stops reading no longer freezes the window
 
     options = Options(cwd=os.getcwd(), model=args.model, effort=args.effort,
                       permission_mode=args.mode, resume=args.resume, continue_last=args.continue_last,
                       prompt=args.prompt, persona=not args.plain, thinking_display=args.thinking,
-                      log_path=args.log)
+                      log_path=args.log, colour=args.colour)
     tty = sys.stdout.isatty()
     old_title = console_title() if tty else None
     if old_title is not None:
